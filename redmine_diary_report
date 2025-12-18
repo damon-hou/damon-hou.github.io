@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redmine 每日工時追蹤器 (雲端同步+自動補單版)</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f3f4f6; }
+        .timer-card { transition: all 0.2s; }
+        .timer-card.active { border-left: 5px solid #10b981; background-color: #ecfdf5; }
+        input[type="number"]::-webkit-inner-spin-button, 
+        input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .modal-overlay { animation: fadeIn 0.2s ease-out forwards; }
+        .modal-content { animation: scaleIn 0.2s ease-out forwards; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <!-- Firebase Logic Module -->
+    <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+        import { getAuth, signInAnonymously, signInWithCustomToken } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+        import { getFirestore, doc, setDoc, getDoc } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+
+        const firebaseConfig = JSON.parse(__firebase_config || '{}');
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        let currentUser = null;
+
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                currentUser = auth.currentUser;
+            } catch (error) { console.error("Auth Error:", error); }
+        };
+        initAuth();
+
+        window.CloudService = {
+            saveData: async (accessKey, data) => {
+                if (!currentUser) await initAuth();
+                if (!accessKey) throw new Error("請輸入存取金鑰");
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'redmine_timer_v3', accessKey);
+                await setDoc(docRef, { ...data, updatedAt: new Date().toISOString(), savedBy: currentUser.uid });
+            },
+            loadData: async (accessKey) => {
+                if (!currentUser) await initAuth();
+                if (!accessKey) throw new Error("請輸入存取金鑰");
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'redmine_timer_v3', accessKey);
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) return docSnap.data();
+                throw new Error("找不到此金鑰的備份資料");
+            }
+        };
+    </script>
+
+    <!-- React App -->
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- Icon Component ---
+        const Icon = ({ name, size = 20, className = "" }) => {
+            const elementRef = useRef(null);
+            useEffect(() => {
+                if (typeof lucide === 'undefined') return;
+                const iconKey = name.split('-').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+                const iconDef = lucide.icons[iconKey];
+                if (iconDef && elementRef.current) {
+                    try {
+                        const svg = lucide.createElement(iconDef);
+                        svg.setAttribute('width', size); svg.setAttribute('height', size); svg.setAttribute('stroke-width', 2);
+                        if (className) svg.setAttribute('class', className);
+                        elementRef.current.innerHTML = ''; elementRef.current.appendChild(svg);
+                    } catch (err) {}
+                }
+            }, [name, size, className]);
+            return <span ref={elementRef} className="inline-flex items-center justify-center" style={{ width: size, height: size }}></span>;
+        };
+
+        // --- Modal ---
+        const Modal = ({ config, onClose }) => {
+            if (!config.isOpen) return null;
+            return (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 modal-overlay p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 modal-content border border-gray-100">
+                        <div className="flex items-center gap-3 mb-4 text-gray-800">
+                            {config.type === 'confirm' ? <div className="p-2 bg-yellow-100 text-yellow-600 rounded-full"><Icon name="alert-triangle" size={24} /></div> : <div className="p-2 bg-blue-100 text-blue-600 rounded-full"><Icon name="info" size={24} /></div>}
+                            <h3 className="text-lg font-bold">{config.title || '提示'}</h3>
+                        </div>
+                        <p className="text-gray-600 mb-8 ml-1 whitespace-pre-wrap text-sm leading-relaxed">{config.message}</p>
+                        <div className="flex justify-end gap-3">
+                            {config.type === 'confirm' && <button onClick={onClose} className="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg">取消</button>}
+                            <button onClick={() => { if (config.onConfirm) config.onConfirm(); onClose(); }} className={`px-5 py-2 rounded-lg text-white font-bold shadow-sm active:scale-95 ${config.type === 'confirm' ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-800 hover:bg-gray-700'}`}>{config.confirmText || '確定'}</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Settings Modal ---
+        const SettingsModal = ({ isOpen, onClose, options, setOptions, workSettings, setWorkSettings }) => {
+            const [inputValue, setInputValue] = useState('');
+            const [localWork, setLocalWork] = useState(workSettings);
+
+            useEffect(() => { if(isOpen) setLocalWork(workSettings); }, [isOpen, workSettings]);
+
+            const saveWorkSettings = () => {
+                setWorkSettings(localWork);
+                onClose();
+            };
+
+            const handleAddOption = (e) => {
+                e.preventDefault();
+                if (inputValue.trim() && !options.includes(inputValue.trim())) {
+                    setOptions([...options, inputValue.trim()]);
+                    setInputValue('');
+                }
+            };
+
+            if (!isOpen) return null;
+
+            return (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 modal-overlay p-4">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6 modal-content border border-gray-100 flex flex-col max-h-[90vh]">
+                        <div className="flex justify-between items-center mb-4">
+                            <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2"><Icon name="settings" size={20} /> 設定</h3>
+                            <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><Icon name="x" /></button>
+                        </div>
+                        
+                        <div className="overflow-y-auto flex-grow pr-2">
+                            {/* Work Hours Settings */}
+                            <div className="mb-6 pb-6 border-b border-gray-100">
+                                <h4 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-2"><Icon name="clock" size={16} /> 出勤時間設定</h4>
+                                <div className="grid grid-cols-2 gap-4 mb-3">
+                                    <div>
+                                        <label className="text-xs text-gray-500 block mb-1">上班時間</label>
+                                        <input type="time" value={localWork.startTime} onChange={e => setLocalWork({...localWork, startTime: e.target.value})} className="w-full border rounded px-2 py-1.5 text-sm" />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs text-gray-500 block mb-1">預設下班時間</label>
+                                        <input type="time" value={localWork.endTime} onChange={e => setLocalWork({...localWork, endTime: e.target.value})} className="w-full border rounded px-2 py-1.5 text-sm" />
+                                    </div>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-500 block mb-1">午休/休息扣除 (小時)</label>
+                                    <input type="number" step="0.5" value={localWork.breakHours} onChange={e => setLocalWork({...localWork, breakHours: parseFloat(e.target.value)})} className="w-full border rounded px-2 py-1.5 text-sm" />
+                                </div>
+                            </div>
+
+                            {/* Activity Types */}
+                            <div className="mb-2">
+                                <h4 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-2"><Icon name="list" size={16} /> 活動類型管理</h4>
+                                <ul className="space-y-2 mb-3">
+                                    {options.map((opt, i) => (
+                                        <li key={i} className="flex justify-between bg-gray-50 px-3 py-2 rounded text-sm text-gray-700">
+                                            <span>{opt}</span>
+                                            <button onClick={() => confirm('刪除?') && setOptions(options.filter((_, idx) => idx !== i))} className="text-gray-300 hover:text-red-500"><Icon name="trash-2" size={14} /></button>
+                                        </li>
+                                    ))}
+                                </ul>
+                                <form onSubmit={handleAddOption} className="flex gap-2">
+                                    <input type="text" className="flex-grow border rounded px-3 py-2 text-sm" placeholder="新增類型" value={inputValue} onChange={e => setInputValue(e.target.value)} />
+                                    <button type="submit" className="bg-gray-800 text-white px-3 rounded hover:bg-gray-700"><Icon name="plus" size={16} /></button>
+                                </form>
+                            </div>
+                        </div>
+                        <div className="flex justify-end pt-4 border-t mt-2">
+                            <button onClick={saveWorkSettings} className="bg-red-600 text-white px-6 py-2 rounded hover:bg-red-700 text-sm font-bold shadow-md">儲存設定</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Searchable Select Component (Improved for Manual Entry Fallback) ---
+        const SearchableSelect = ({ label, value, onChange, options = [], onRefresh, placeholder, isLoading, emptyText = "無資料" }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            const [search, setSearch] = useState('');
+            const wrapperRef = useRef(null);
+
+            // Sync internal search state with external value
+            useEffect(() => {
+                const selectedOption = options.find(o => String(o.id) === String(value));
+                if (selectedOption) {
+                    setSearch(selectedOption.name);
+                } else if (value && value !== search) {
+                    setSearch(value); // Assume manual entry
+                } else if (!value) {
+                    setSearch('');
+                }
+            }, [value, options]);
+
+            // Click outside handler
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
+                        setIsOpen(false);
+                    }
+                };
+                document.addEventListener("mousedown", handleClickOutside);
+                return () => document.removeEventListener("mousedown", handleClickOutside);
+            }, []);
+
+            const filteredOptions = options.filter(o => 
+                o.name.toLowerCase().includes(search.toLowerCase())
+            );
+
+            const handleSelect = (option) => {
+                onChange(option.id);
+                setSearch(option.name);
+                setIsOpen(false);
+            };
+
+            const handleInputChange = (e) => {
+                const newValue = e.target.value;
+                setSearch(newValue);
+                onChange(newValue); // Update parent directly to allow manual entry
+                setIsOpen(true);
+            };
+
+            return (
+                <div className="relative" ref={wrapperRef}>
+                    <label className="text-xs text-gray-500 mb-0.5 block">{label}</label>
+                    <div className="flex gap-1">
+                        <div className="relative w-full">
+                            <input 
+                                type="text"
+                                placeholder={placeholder}
+                                value={search}
+                                onChange={handleInputChange}
+                                onFocus={() => setIsOpen(true)}
+                                className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none text-sm bg-white"
+                            />
+                            {isOpen && (
+                                <ul className="absolute z-50 w-full bg-white border border-gray-200 rounded shadow-lg max-h-48 overflow-y-auto mt-1 text-sm">
+                                    {isLoading ? (
+                                        <li className="px-3 py-2 text-gray-400 text-center">載入中...</li>
+                                    ) : filteredOptions.length > 0 ? (
+                                        filteredOptions.map(option => (
+                                            <li 
+                                                key={option.id}
+                                                onClick={() => handleSelect(option)}
+                                                className={`px-3 py-2 cursor-pointer hover:bg-orange-50 ${String(option.id) === String(value) ? 'bg-orange-100 text-orange-900 font-medium' : 'text-gray-700'}`}
+                                            >
+                                                {option.name}
+                                            </li>
+                                        ))
+                                    ) : (
+                                        <li className="px-3 py-2 text-gray-400 text-center">{options.length === 0 ? "請直接輸入 ID" : "無符合選項 (可直接輸入)"}</li>
+                                    )}
+                                </ul>
+                            )}
+                        </div>
+                        <button 
+                            onClick={onRefresh} 
+                            disabled={isLoading}
+                            className="bg-white border border-gray-300 text-gray-500 hover:text-orange-600 hover:border-orange-400 rounded px-2 flex items-center justify-center transition-colors disabled:opacity-50 flex-shrink-0"
+                            title="重新載入清單"
+                        >
+                            <Icon name="refresh-cw" size={14} className={isLoading ? "animate-spin" : ""} />
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Redmine Gap Filler Component (Fixed Fetch) ---
+        const RedmineGapFiller = ({ gapHours, date, onSuccess, showAlert }) => {
+            const [config, setConfig] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('redmine_api_config') || '{}'); } catch { return {}; }
+            });
+            const [subject, setSubject] = useState(`補足工時 - ${date}`);
+            const [description, setDescription] = useState(`自動補足 ${date} 出勤時數，共 ${gapHours} 小時。`);
+            const [doneRatio, setDoneRatio] = useState(100);
+            const [loading, setLoading] = useState(false);
+            const [createLog, setCreateLog] = useState(true);
+            const [projects, setProjects] = useState([]);
+            const [trackers, setTrackers] = useState([]);
+            const [loadingLists, setLoadingLists] = useState({ projects: false, trackers: false });
+
+            useEffect(() => { localStorage.setItem('redmine_api_config', JSON.stringify(config)); }, [config]);
+
+            const fetchList = async (type) => {
+                if (!config.host || !config.apiKey) return showAlert("錯誤", "請先填寫 Host 與 API Key");
+                
+                setLoadingLists(prev => ({ ...prev, [type]: true }));
+                const baseUrl = config.host.replace(/\/$/, '');
+                const endpoint = type === 'projects' ? '/projects.json?limit=100' : '/trackers.json';
+                
+                try {
+                    const res = await fetch(`${baseUrl}${endpoint}`, {
+                        headers: { 'Content-Type': 'application/json', 'X-Redmine-API-Key': config.apiKey }
+                    });
+                    if (!res.ok) throw new Error(`Status ${res.status}`);
+                    const data = await res.json();
+                    
+                    if (type === 'projects') {
+                        setProjects(data.projects.map(p => ({ id: p.id, name: p.name })));
+                        showAlert("成功", `已載入 ${data.projects.length} 個專案`);
+                    } else {
+                        setTrackers(data.trackers.map(t => ({ id: t.id, name: t.name })));
+                        showAlert("成功", `已載入 ${data.trackers.length} 個追蹤標籤`);
+                    }
+                } catch (e) {
+                    console.warn("Redmine API Fetch Warning:", e); // Change error to warn to avoid scary console logs
+                    let msg = `自動載入失敗 (${e.message})。`;
+                    msg += "\n\n原因可能為：\n1. 跨網域 (CORS) 限制 (最常見)。\n2. 伺服器未支援 HTTPS。\n\n✅ 您可以「直接手動輸入」專案 ID 與追蹤標籤 ID 繼續操作。";
+                    showAlert("API 連線提示", msg);
+                } finally {
+                    setLoadingLists(prev => ({ ...prev, [type]: false }));
+                }
+            };
+
+            const handleCreate = async () => {
+                if (!config.host || !config.apiKey || !config.projectId) return showAlert("錯誤", "請設定 Redmine 專案與 API Key");
+                
+                setLoading(true);
+                const baseUrl = config.host.replace(/\/$/, '');
+                
+                try {
+                    // Create Issue
+                    const issuePayload = {
+                        issue: {
+                            project_id: config.projectId,
+                            tracker_id: config.trackerId,
+                            subject: subject,
+                            description: description,
+                            done_ratio: doneRatio
+                        }
+                    };
+
+                    const issueRes = await fetch(`${baseUrl}/issues.json`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Redmine-API-Key': config.apiKey },
+                        body: JSON.stringify(issuePayload)
+                    });
+
+                    if (!issueRes.ok) throw new Error(`建立 Issue 失敗: ${issueRes.status} ${issueRes.statusText}`);
+                    const issueData = await issueRes.json();
+                    const newIssueId = issueData.issue.id;
+
+                    let successMsg = `成功建立 Issue #${newIssueId}！`;
+
+                    // Log Time
+                    if (createLog) {
+                        if (!config.timeActivityId) throw new Error("回報工時需填寫工時活動 ID");
+                        
+                        const timeRes = await fetch(`${baseUrl}/time_entries.json`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-Redmine-API-Key': config.apiKey },
+                            body: JSON.stringify({
+                                time_entry: {
+                                    issue_id: newIssueId,
+                                    hours: gapHours,
+                                    activity_id: config.timeActivityId,
+                                    spent_on: date,
+                                    comments: '系統自動補單'
+                                }
+                            })
+                        });
+                        if (!timeRes.ok) throw new Error(`工時回報失敗: ${timeRes.status}`);
+                        successMsg += `\n並已寫入 ${gapHours} 小時工時。`;
+                    }
+
+                    showAlert("成功", successMsg);
+                    if (onSuccess) onSuccess(newIssueId, gapHours);
+
+                } catch (e) {
+                    console.error(e);
+                    showAlert("API 錯誤", e.message + "\n(請檢查跨網域 CORS 設定或 API Key 權限)");
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            return (
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 mb-6 shadow-sm text-sm">
+                    <div className="flex items-center gap-2 mb-4 text-orange-800 font-bold text-base">
+                        <Icon name="alert-circle" size={20} />
+                        <span>工時不足 {gapHours} 小時，快速補單</span>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                        {/* Config Section */}
+                        <div className="space-y-3 p-3 bg-orange-100/50 rounded-lg border border-orange-100">
+                            <label className="block font-bold text-orange-900 flex items-center gap-1"><Icon name="settings-2" size={14} /> Redmine 設定</label>
+                            <input type="text" placeholder="URL (e.g. https://redmine.org)" value={config.host||''} onChange={e=>setConfig({...config, host: e.target.value})} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none" />
+                            <input type="password" placeholder="API Key" value={config.apiKey||''} onChange={e=>setConfig({...config, apiKey: e.target.value})} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none" />
+                            
+                            <div className="grid grid-cols-2 gap-2">
+                                <SearchableSelect 
+                                    label="專案 (Project)"
+                                    placeholder="輸入 ID 或搜尋..."
+                                    value={config.projectId}
+                                    onChange={(val) => setConfig({...config, projectId: val})}
+                                    options={projects}
+                                    isLoading={loadingLists.projects}
+                                    onRefresh={() => fetchList('projects')}
+                                    emptyText="無法連線，請直接輸入 ID"
+                                />
+                                <SearchableSelect 
+                                    label="追蹤標籤 (Tracker)"
+                                    placeholder="輸入 ID 或搜尋..."
+                                    value={config.trackerId}
+                                    onChange={(val) => setConfig({...config, trackerId: val})}
+                                    options={trackers}
+                                    isLoading={loadingLists.trackers}
+                                    onRefresh={() => fetchList('trackers')}
+                                    emptyText="無法連線，請直接輸入 ID"
+                                />
+                            </div>
+                            
+                            <div>
+                                <label className="text-xs text-gray-500 mb-0.5 block">工時活動 ID (回報用)</label>
+                                <input type="number" placeholder="Activity ID (e.g. 9)" value={config.timeActivityId||''} onChange={e=>setConfig({...config, timeActivityId: e.target.value})} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none" />
+                            </div>
+                        </div>
+
+                        {/* Issue Details Section */}
+                        <div className="space-y-3 p-3 bg-white rounded-lg border border-gray-200">
+                            <label className="block font-bold text-gray-700 flex items-center gap-1"><Icon name="file-plus" size={14} /> 補單內容</label>
+                            <div>
+                                <label className="text-xs text-gray-500 mb-0.5 block">主旨</label>
+                                <input type="text" placeholder="主旨" value={subject} onChange={e=>setSubject(e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none" />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-500 mb-0.5 block">概述</label>
+                                <textarea placeholder="概述" rows={4} value={description} onChange={e=>setDescription(e.target.value)} className="w-full border rounded px-2 py-1.5 resize-none focus:border-orange-500 outline-none" />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-500 mb-0.5 block">完成百分比</label>
+                                <select value={doneRatio} onChange={e=>setDoneRatio(e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none bg-white">
+                                    {[0,10,20,30,40,50,60,70,80,90,100].map(r => <option key={r} value={r}>{r}%</option>)}
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-3 border-t border-orange-200">
+                        <label className="flex items-center gap-2 text-gray-700 cursor-pointer select-none font-medium">
+                            <input type="checkbox" checked={createLog} onChange={e=>setCreateLog(e.target.checked)} className="rounded text-orange-600 focus:ring-orange-500" />
+                            <span>同時回報工時 (Log Time)</span>
+                        </label>
+                        <button onClick={handleCreate} disabled={loading} className="bg-orange-600 hover:bg-orange-700 text-white px-6 py-2.5 rounded-lg font-bold flex items-center gap-2 disabled:opacity-50 transition-colors shadow-sm">
+                            {loading ? <Icon name="loader-2" className="animate-spin" size={18} /> : <Icon name="send" size={18} />}
+                            {loading ? "處理中..." : "建立單據"}
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Main App ---
+        const App = () => {
+            const [tasks, setTasks] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_tasks') || '[]').map(t => ({...t, isRunning: false})); } catch { return []; } });
+            const [activityOptions, setActivityOptions] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_activity_options_v2') || '[]').length ? JSON.parse(localStorage.getItem('redmine_activity_options_v2')) : ['Design', 'Development', 'Testing', 'Management']; } catch { return ['Design', 'Development', 'Testing', 'Management']; } });
+            const [globalDate, setGlobalDate] = useState(() => localStorage.getItem('redmine_date') || new Date().toISOString().split('T')[0]);
+            const [userName, setUserName] = useState(() => localStorage.getItem('redmine_user_v2') || '');
+            const [accessKey, setAccessKey] = useState(() => localStorage.getItem('redmine_access_key') || '');
+            
+            // New Work Settings
+            const [workSettings, setWorkSettings] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('redmine_work_settings') || '{"startTime":"09:00", "endTime":"18:00", "breakHours": 1}'); } catch { return {startTime:"09:00", endTime:"18:00", breakHours: 1}; }
+            });
+
+            const [newTask, setNewTask] = useState({ issueId: '', comment: '', activityId: activityOptions[0], projectName: '' });
+            const [roundTo, setRoundTo] = useState(0.25);
+            const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+            const [modalConfig, setModalConfig] = useState({ isOpen: false, type: 'alert', title: '', message: '' });
+            const [isLoading, setIsLoading] = useState(false);
+            const commentInputRef = useRef(null);
+
+            useEffect(() => localStorage.setItem('redmine_user_v2', userName), [userName]);
+            useEffect(() => localStorage.setItem('redmine_activity_options_v2', JSON.stringify(activityOptions)), [activityOptions]);
+            useEffect(() => { localStorage.setItem('redmine_tasks', JSON.stringify(tasks)); localStorage.setItem('redmine_date', globalDate); }, [tasks, globalDate]);
+            useEffect(() => localStorage.setItem('redmine_access_key', accessKey), [accessKey]);
+            useEffect(() => localStorage.setItem('redmine_work_settings', JSON.stringify(workSettings)), [workSettings]);
+            useEffect(() => { if (activityOptions.length && !activityOptions.includes(newTask.activityId)) setNewTask(p => ({...p, activityId: activityOptions[0]})); }, [activityOptions]);
+
+            useEffect(() => {
+                const interval = setInterval(() => setTasks(ts => ts.map(t => t.isRunning ? {...t, duration: t.duration + 1000} : t)), 1000);
+                return () => clearInterval(interval);
+            }, []);
+
+            const showConfirm = (title, message, onConfirm) => setModalConfig({ isOpen: true, type: 'confirm', title, message, onConfirm });
+            const showAlert = (title, message) => setModalConfig({ isOpen: true, type: 'alert', title, message });
+            const closeModal = () => setModalConfig(p => ({...p, isOpen: false}));
+
+            const addTask = (e) => { e.preventDefault(); if (!newTask.issueId) return; setTasks([...tasks, { id: Date.now(), ...newTask, duration: 0, isRunning: false }]); setNewTask({ ...newTask, issueId: '', comment: '' }); };
+            const updateTask = (id, f, v) => setTasks(ts => ts.map(t => t.id===id ? {...t, [f]: v} : t));
+            const toggleTimer = (id) => setTasks(ts => ts.map(t => t.id===id ? {...t, isRunning: !t.isRunning} : {...t, isRunning: false}));
+            const adjustTime = (id, m) => setTasks(ts => ts.map(t => t.id===id ? {...t, duration: Math.max(0, t.duration + m*60000)} : t));
+            const updateTaskDuration = (id, newDuration) => setTasks(tasks.map(task => task.id === id ? { ...task, duration: Math.max(0, newDuration) } : task));
+            const deleteTask = (id) => showConfirm("刪除", "確定刪除?", () => setTasks(ts => ts.filter(t => t.id !== id)));
+            const clearAll = () => showConfirm("清空", "確定清空?", () => { setTasks([]); localStorage.removeItem('redmine_tasks'); });
+            
+            const getDecimalHours = (ms) => { const h = ms / 3600000; return roundTo === 0 ? h.toFixed(2) : (Math.ceil(h / roundTo) * roundTo).toFixed(2); };
+
+            // Calculate Gap
+            const totalHours = tasks.reduce((acc, curr) => acc + parseFloat(getDecimalHours(curr.duration)), 0);
+            
+            const calculateExpectedHours = () => {
+                const start = new Date(`2000-01-01T${workSettings.startTime}`);
+                const end = new Date(`2000-01-01T${workSettings.endTime}`);
+                let diff = (end - start) / 3600000; // hours
+                diff -= workSettings.breakHours;
+                return Math.max(0, diff);
+            };
+            const expectedHours = calculateExpectedHours();
+            const gapHours = (expectedHours - totalHours).toFixed(2);
+            const isGap = parseFloat(gapHours) > 0;
+
+            const handleCloudSave = async () => {
+                if (!accessKey.trim()) return showAlert("錯誤", "請設定存取金鑰");
+                setIsLoading(true);
+                try {
+                    const dataToSave = { userName, activityOptions, tasks: tasks.map(t => ({...t, isRunning: false})), globalDate, workSettings }; 
+                    await window.CloudService.saveData(accessKey.trim(), dataToSave);
+                    showAlert("上傳成功", "資料已同步至雲端！");
+                } catch (e) { console.error(e); showAlert("上傳失敗", "請稍後再試。"); } finally { setIsLoading(false); }
+            };
+
+            const handleCloudLoad = async () => {
+                if (!accessKey.trim()) return showAlert("錯誤", "請輸入存取金鑰");
+                showConfirm("確認讀取", "讀取將覆蓋目前資料，確定嗎？", async () => {
+                    setIsLoading(true);
+                    try {
+                        const data = await window.CloudService.loadData(accessKey.trim());
+                        if (data.userName) setUserName(data.userName);
+                        if (data.activityOptions) setActivityOptions(data.activityOptions);
+                        if (data.tasks) setTasks(data.tasks);
+                        if (data.globalDate) setGlobalDate(data.globalDate);
+                        if (data.workSettings) setWorkSettings(data.workSettings);
+                        showAlert("讀取成功", "資料已還原！");
+                    } catch (e) { showAlert("讀取失敗", e.message || "找不到資料"); } finally { setIsLoading(false); }
+                });
+            };
+
+            const exportCSV = () => {
+                if (!userName.trim()) return showAlert("錯誤", "請輸入用戶名稱");
+                const BOM = "\uFEFF";
+                const headers = ["專案", "日期", "用戶", "活動", "議題", "回應", "小時"];
+                const rows = tasks.map(t => {
+                    const h = getDecimalHours(t.duration);
+                    if (parseFloat(h) <= 0) return null;
+                    return [`"${(t.projectName||'').replace(/"/g,'""')}"`, globalDate, userName, t.activityId, t.issueId, `"${t.comment.replace(/"/g,'""').replace(/\n/g,'\u3000')}"`, h].join(",");
+                }).filter(r => r);
+                if (!rows.length) return showAlert("錯誤", "無有效工時");
+                const url = URL.createObjectURL(new Blob([BOM + headers.join(",") + "\r\n" + rows.join("\r\n")], {type: "text/csv;charset=utf-8;"}));
+                const link = document.createElement("a"); link.href = url; link.download = `redmine_${globalDate}.csv`; link.click();
+            };
+
+            const stepMinutes = roundTo > 0 ? Math.round(roundTo * 60) : 1;
+
+            return (
+                <div className="min-h-screen pb-10 relative">
+                    <Modal config={modalConfig} onClose={closeModal} />
+                    <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} options={activityOptions} setOptions={setActivityOptions} workSettings={workSettings} setWorkSettings={setWorkSettings} />
+
+                    {/* Header */}
+                    <div className="bg-white shadow-sm sticky top-0 z-10">
+                        <div className="max-w-4xl mx-auto px-4 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
+                            <div className="flex items-center gap-2 w-full sm:w-auto">
+                                <div className="p-2 bg-red-700 text-white rounded-lg"><Icon name="clock" /></div>
+                                <h1 className="text-xl font-bold text-gray-800">Redmine 工時助手</h1>
+                            </div>
+                            <div className="flex items-center gap-4 w-full sm:w-auto justify-between sm:justify-end">
+                                <div className="text-right">
+                                    <div className="text-xs text-gray-500">預計下班</div>
+                                    <input type="time" value={workSettings.endTime} onChange={e => setWorkSettings({...workSettings, endTime: e.target.value})} className="font-mono bg-transparent border-b border-gray-300 focus:border-red-500 outline-none w-20 text-right" />
+                                </div>
+                                <div className="text-right">
+                                    <div className="text-xs text-gray-500">日期</div>
+                                    <input type="date" value={globalDate} onChange={e => setGlobalDate(e.target.value)} className="font-mono bg-transparent border-b border-gray-300 focus:border-red-500 outline-none" />
+                                </div>
+                                <div className="text-right pl-4 border-l">
+                                    <div className="text-xs text-gray-500">
+                                        目標 {expectedHours.toFixed(1)} / 已記 {totalHours.toFixed(2)}
+                                    </div>
+                                    <div className={`text-2xl font-bold font-mono ${isGap ? 'text-orange-500' : 'text-green-600'}`}>
+                                        {isGap ? `-${gapHours}` : 'OK'} <span className="text-sm text-gray-400">hr</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="max-w-4xl mx-auto px-4 mt-6">
+                        {/* Cloud Sync Bar */}
+                        <div className="bg-blue-50 border border-blue-100 p-3 rounded-xl mb-6 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
+                            <div className="flex items-center gap-2 text-blue-800 text-sm font-medium">
+                                <Icon name="cloud" size={18} />
+                                <span>雲端同步</span>
+                                <span className="text-xs text-blue-400 font-normal hidden sm:inline">(網址變動救星)</span>
+                            </div>
+                            <div className="flex gap-2 w-full sm:w-auto">
+                                <input type="text" placeholder="金鑰 (如: peter-dev)" value={accessKey} onChange={(e) => setAccessKey(e.target.value)} className="px-3 py-1.5 rounded border border-blue-200 text-sm w-full sm:w-48 focus:outline-none focus:ring-2 focus:ring-blue-400" />
+                                <button onClick={handleCloudSave} disabled={isLoading} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm flex items-center gap-1 disabled:opacity-50"><Icon name="upload-cloud" size={14} /> 上傳</button>
+                                <button onClick={handleCloudLoad} disabled={isLoading} className="bg-white hover:bg-gray-50 text-blue-600 border border-blue-200 px-3 py-1.5 rounded text-sm flex items-center gap-1 disabled:opacity-50"><Icon name="download-cloud" size={14} /> 下載</button>
+                            </div>
+                        </div>
+
+                        {/* Gap Filler */}
+                        {isGap && <RedmineGapFiller gapHours={gapHours} date={globalDate} showAlert={showAlert} onSuccess={()=>{/* optional refresh logic */}} />}
+
+                        {/* Control Panel */}
+                        <div className="bg-white p-6 rounded-xl shadow-sm mb-6">
+                            <form onSubmit={addTask} className="flex flex-col gap-4">
+                                <div className="flex flex-col md:flex-row gap-4 items-start">
+                                    <div className="flex-none md:w-32 w-full">
+                                        <label className="text-xs text-gray-500 mb-1 block">Issue ID #</label>
+                                        <input type="number" placeholder="12345" className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" value={newTask.issueId} onChange={e => setNewTask({...newTask, issueId: e.target.value})} required />
+                                    </div>
+                                    <div className="flex-none md:w-40 w-full">
+                                        <label className="text-xs text-gray-500 mb-1 block">專案 (選填)</label>
+                                        <input type="text" placeholder="專案名稱" className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" value={newTask.projectName} onChange={e => setNewTask({...newTask, projectName: e.target.value})} />
+                                    </div>
+                                    <div className="flex-grow w-full">
+                                        <label className="text-xs text-gray-500 mb-1 block">任務說明</label>
+                                        <textarea placeholder="說明..." className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none resize-y overflow-hidden leading-normal" rows={1} value={newTask.comment} onChange={e => { setNewTask({...newTask, comment: e.target.value}); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }} style={{minHeight:'42px'}} />
+                                    </div>
+                                </div>
+                                <div className="flex flex-col md:flex-row gap-4">
+                                    <div className="flex-none md:w-48">
+                                         <label className="text-xs text-gray-500 mb-1 block">活動類型</label>
+                                         <div className="flex gap-2">
+                                            <select className="flex-grow bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-500" value={newTask.activityId} onChange={e => setNewTask({...newTask, activityId: e.target.value})}>
+                                                {activityOptions.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                                            </select>
+                                            <button type="button" onClick={() => setIsSettingsOpen(true)} className="flex-none p-2 bg-gray-100 border border-gray-200 rounded-lg text-gray-600 hover:bg-gray-200" title="設定"><Icon name="settings" size={20} /></button>
+                                         </div>
+                                    </div>
+                                    <div className="flex-grow">
+                                        <label className="text-xs text-gray-500 mb-1 block">用戶名稱</label>
+                                        <input type="text" placeholder="您的姓名" value={userName} onChange={e => setUserName(e.target.value)} onBlur={() => localStorage.setItem('redmine_user_v2', userName)} className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" />
+                                    </div>
+                                    <div className="flex-none flex items-end">
+                                        <button type="submit" className="w-full bg-gray-800 hover:bg-gray-700 text-white px-6 py-2 rounded-lg flex items-center justify-center gap-2"><Icon name="plus" size={18} /> 新增任務</button>
+                                    </div>
+                                </div>
+                            </form>
+                            <div className="mt-4 pt-4 border-t flex items-center justify-between text-sm text-gray-500">
+                                <div className="flex items-center gap-2"><span>進位單位：</span><select value={roundTo} onChange={e => setRoundTo(parseFloat(e.target.value))} className="bg-gray-100 border-none rounded px-2 py-1"><option value={0}>不進位</option><option value={0.1}>0.1 小時 (6分)</option><option value={0.25}>0.25 小時 (15分)</option><option value={0.5}>0.5 小時 (30分)</option></select></div>
+                            </div>
+                        </div>
+
+                        {/* Task List */}
+                        <div className="space-y-3">
+                            {tasks.length === 0 && <div className="text-center py-12 text-gray-400 bg-white rounded-xl border-2 border-dashed border-gray-200"><Icon name="coffee" size={48} className="mx-auto mb-3 opacity-50" /><p>輸入 Issue ID 開始工作吧！</p></div>}
+                            {tasks.map(task => (
+                                <div key={task.id} className={`timer-card bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex flex-col sm:flex-row items-center justify-between gap-4 ${task.isRunning ? 'active' : ''}`}>
+                                    <div className="flex items-center gap-4 flex-grow w-full sm:w-auto">
+                                        <div className={`p-3 rounded-full flex-shrink-0 ${task.isRunning ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-400'}`}>{task.isRunning ? <Icon name="play" className="fill-current" /> : <Icon name="pause" />}</div>
+                                        <div className="flex-grow min-w-0">
+                                            <div className="flex items-center gap-2 flex-wrap mb-1">
+                                                <div className="flex items-center bg-gray-100 rounded px-1.5 py-0.5 hover:bg-gray-200 group focus-within:ring-1 focus-within:ring-red-500">
+                                                    <span className="text-xs text-gray-500 font-bold mr-0.5">#</span>
+                                                    <input type="text" value={task.issueId} onChange={e => updateTask(task.id, 'issueId', e.target.value)} className="bg-transparent border-none outline-none text-xs font-bold text-gray-700 w-14 font-mono" />
+                                                </div>
+                                                <input type="text" value={task.projectName} onChange={e => updateTask(task.id, 'projectName', e.target.value)} placeholder="專案..." className="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded border border-blue-100 hover:border-blue-300 focus:border-blue-500 outline-none w-24 placeholder-blue-300" />
+                                                <select value={task.activityId} onChange={e => updateTask(task.id, 'activityId', e.target.value)} className="text-xs text-gray-500 border border-gray-200 hover:border-gray-400 bg-white rounded px-1 py-0.5 focus:border-red-500 outline-none max-w-[120px]">
+                                                    {activityOptions.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                                                </select>
+                                            </div>
+                                            <TaskTextarea value={task.comment} onChange={e => updateTask(task.id, 'comment', e.target.value)} />
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-4 w-full sm:w-auto justify-between sm:justify-end">
+                                        <div className="text-right">
+                                            <TimeInput duration={task.duration} isRunning={task.isRunning} onUpdate={d => updateTaskDuration(task.id, d)} />
+                                            <div className="text-xs text-gray-400 font-mono text-right mt-1">≈ {getDecimalHours(task.duration)} hr</div>
+                                        </div>
+                                        <div className="flex items-center gap-1">
+                                            <button onClick={() => toggleTimer(task.id)} className={`p-2 rounded-lg transition-colors ${task.isRunning ? 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200' : 'bg-green-100 text-green-700 hover:bg-green-200'}`}>{task.isRunning ? <Icon name="pause" /> : <Icon name="play" />}</button>
+                                        </div>
+                                    </div>
+                                    <div className="flex sm:flex-col gap-2 border-t sm:border-t-0 sm:border-l pt-3 sm:pt-0 sm:pl-3 w-full sm:w-auto justify-center">
+                                        <div className="flex gap-2">
+                                            <button onClick={() => adjustTime(task.id, stepMinutes)} className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded text-gray-600">+{stepMinutes}m</button>
+                                            <button onClick={() => adjustTime(task.id, -stepMinutes)} className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded text-gray-600">-{stepMinutes}m</button>
+                                        </div>
+                                        <button onClick={() => deleteTask(task.id)} className="text-red-400 hover:text-red-600 text-sm flex items-center justify-center gap-1 mt-1"><Icon name="trash-2" size={14} /> 刪除</button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        {tasks.length > 0 && (
+                            <div className="mt-8 flex justify-between items-center bg-gray-800 text-white p-4 rounded-xl shadow-lg">
+                                <div className="text-sm text-gray-300 hidden sm:block">準備下班了嗎？</div>
+                                <div className="flex gap-3 w-full sm:w-auto justify-end">
+                                    <button onClick={clearAll} className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">清空列表</button>
+                                    <button onClick={exportCSV} className="bg-red-600 hover:bg-red-500 text-white px-6 py-2 rounded-lg font-bold flex items-center gap-2 shadow-lg transform active:scale-95 transition-all"><Icon name="download" size={18} /> 匯出 CSV</button>
+                                </div>
+                            </div>
+                        )}
+                        <div className="mt-8 text-center text-xs text-gray-400 pb-8">匯出的 CSV 格式包含 BOM 標頭，Excel 可直接開啟不亂碼。</div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
