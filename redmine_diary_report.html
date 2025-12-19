@@ -693,6 +693,7 @@
             const commentInputRef = useRef(null);
             
             // Sync State
+            const [isServiceReady, setIsServiceReady] = useState(false);
             const [isInitialized, setIsInitialized] = useState(false);
             const [syncStatus, setSyncStatus] = useState('idle');
             const [lastSyncTime, setLastSyncTime] = useState(null);
@@ -722,11 +723,28 @@
                 return () => clearInterval(interval);
             }, []);
 
+            // Wait for Service Ready
+            useEffect(() => {
+                const checkService = () => {
+                    if (window.CloudService) {
+                        setIsServiceReady(true);
+                        return true;
+                    }
+                    return false;
+                };
+                if (!checkService()) {
+                    const interval = setInterval(() => {
+                        if (checkService()) clearInterval(interval);
+                    }, 200);
+                    return () => clearInterval(interval);
+                }
+            }, []);
+
             // --- Unified Cloud Sync Function ---
             const saveToCloud = useCallback(async (dataOverride = null) => {
+                if (!window.CloudService) return;
                 setSyncStatus('saving');
                 try {
-                    // Use ref to get latest state, ensuring no stale closures and no dependency on 'tasks' triggering this unless intended
                     const currentState = stateRef.current;
                     const dataToSave = dataOverride || { 
                         userName: currentState.userName, 
@@ -751,6 +769,8 @@
 
             // --- Initial Auto-Load from Cloud ---
             useEffect(() => {
+                if (!isServiceReady) return;
+
                 const init = async () => {
                     try {
                         const data = await window.CloudService.loadData(FIXED_ACCESS_KEY);
@@ -774,11 +794,11 @@
                     }
                 };
                 init();
-            }, []);
+            }, [isServiceReady]);
 
             // --- Effect 1: Auto-Save for SETTINGS changes (Fast debounce 500ms) ---
             useEffect(() => {
-                if (!isInitialized) return; // Prevent saving default/empty state over cloud data
+                if (!isInitialized) return; 
                 const timer = setTimeout(() => {
                     saveToCloud();
                 }, 500);
@@ -808,7 +828,10 @@
                         if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
                         setLastSyncTime(new Date(data.updatedAt || Date.now()));
                         showAlert("還原成功", "資料已同步至最新狀態！");
-                    } catch (e) { showAlert("還原失敗", e.message); }
+                    } catch (e) { 
+                        const msg = e.message.includes('OFFLINE_MODE') ? "目前無法連線至雲端 (離線模式)" : e.message;
+                        showAlert("還原失敗", msg); 
+                    }
                 });
             };
 
