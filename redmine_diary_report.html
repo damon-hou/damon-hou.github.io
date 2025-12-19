@@ -33,16 +33,16 @@
         import { getFirestore, doc, setDoc, getDoc, initializeFirestore } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
 
         // ==========================================
-        // [本地環境設定區]
-        // 若您下載此檔案在本地執行，請將 Firebase Console 取得的 config 填入下方
+        // [本地環境設定區] - 請務必替換為您自己的 Firebase 設定
+        // 若使用預設值，將無法啟用「匿名登入」，會導致 auth/admin-restricted-operation 錯誤
         // ==========================================
         const localFirebaseConfig = {
-  apiKey: "AIzaSyD5_L45J3r_M0YhOPNhbdl5IkJTWgL1a-8",
-  authDomain: "redmine-diary-report.firebaseapp.com",
-  projectId: "redmine-diary-report",
-  storageBucket: "redmine-diary-report.firebasestorage.app",
-  messagingSenderId: "1024872032156",
-  appId: "1:1024872032156:web:f072756a51d58967244a59"
+            apiKey: "AIzaSyD5_L45J3r_M0YhOPNhbdl5IkJTWgL1a-8",
+            authDomain: "redmine-diary-report.firebaseapp.com",
+            projectId: "redmine-diary-report",
+            storageBucket: "redmine-diary-report.firebasestorage.app",
+            messagingSenderId: "1024872032156",
+            appId: "1:1024872032156:web:f072756a51d58967244a59"
         };
 
         let app, auth, db;
@@ -83,7 +83,6 @@
         // Auth Singleton
         let authReadyPromise = new Promise((resolve, reject) => {
             if (!isFirebaseAvailable) {
-                // Resolve with null if firebase is missing, handled downstream
                 return resolve(null);
             }
             
@@ -95,7 +94,13 @@
                     if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                         signInWithCustomToken(auth, __initial_auth_token).catch(e => console.error("Token sign-in failed", e));
                     } else {
-                        signInAnonymously(auth).catch(e => console.error("Anon sign-in failed", e));
+                        signInAnonymously(auth).catch(e => {
+                            console.error("Anon sign-in failed", e);
+                            // 新增：針對未啟用匿名登入的錯誤提示
+                            if (e.code === 'auth/admin-restricted-operation' || e.code === 'auth/operation-not-allowed') {
+                                alert("【雲端同步設定錯誤】\n\n您的 Firebase 專案未啟用「匿名登入 (Anonymous)」功能。\n\n請前往 Firebase Console -> Authentication -> Sign-in method，將「匿名 (Anonymous)」狀態設為「啟用 (Enabled)」。");
+                            }
+                        });
                     }
                 }
             });
