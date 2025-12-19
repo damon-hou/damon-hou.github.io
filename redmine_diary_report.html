@@ -32,29 +32,49 @@
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
         import { getFirestore, doc, setDoc, getDoc, initializeFirestore } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
 
-        const firebaseConfig = JSON.parse(__firebase_config || '{}');
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        
-        // Fix: Force Long Polling AND disable fetch streams for maximum compatibility
-        const db = initializeFirestore(app, {
-            experimentalForceLongPolling: true,
-            useFetchStreams: false, 
-        });
-
+        let app, auth, db;
+        let isFirebaseAvailable = false;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
-        // Robust Auth Singleton
-        let authReadyPromise = new Promise((resolve) => {
+        // Robust Initialization
+        try {
+            // Safe check for __firebase_config
+            const configStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+            
+            if (configStr) {
+                const firebaseConfig = JSON.parse(configStr);
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                
+                // Force Long Polling for stability
+                db = initializeFirestore(app, {
+                    experimentalForceLongPolling: true,
+                    useFetchStreams: false, 
+                });
+                isFirebaseAvailable = true;
+            } else {
+                console.warn("Firebase config not found. Cloud sync will be unavailable.");
+            }
+        } catch (e) {
+            console.error("Firebase init failed:", e);
+        }
+
+        // Auth Singleton
+        let authReadyPromise = new Promise((resolve, reject) => {
+            if (!isFirebaseAvailable) {
+                // Resolve with null if firebase is missing, handled downstream
+                return resolve(null);
+            }
+            
             const unsubscribe = onAuthStateChanged(auth, (user) => {
                 if (user) {
                     unsubscribe();
                     resolve(user);
                 } else {
                     if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                        signInWithCustomToken(auth, __initial_auth_token).catch(console.error);
+                        signInWithCustomToken(auth, __initial_auth_token).catch(e => console.error("Token sign-in failed", e));
                     } else {
-                        signInAnonymously(auth).catch(console.error);
+                        signInAnonymously(auth).catch(e => console.error("Anon sign-in failed", e));
                     }
                 }
             });
@@ -66,7 +86,6 @@
                 try {
                     return await operation();
                 } catch (error) {
-                    // Retry on common network errors
                     if (i < maxRetries - 1 && (error.code === 'unavailable' || error.message.includes('offline') || error.message.includes('network'))) {
                         console.warn(`Firestore unavailable, retrying... (${i + 1})`);
                         await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
@@ -77,8 +96,11 @@
             }
         };
 
+        // Expose Service
         window.CloudService = {
             saveData: async (accessKey, data) => {
+                if (!isFirebaseAvailable) throw new Error("OFFLINE_MODE (No Config)");
+                
                 const user = await authReadyPromise;
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 
@@ -88,7 +110,6 @@
                         await setDoc(docRef, { ...data, updatedAt: new Date().toISOString(), savedBy: user.uid }, { merge: true });
                     });
                 } catch (e) {
-                    // Normalize error for frontend
                     if (e.code === 'unavailable' || e.message.includes('offline')) {
                         throw new Error("OFFLINE_MODE");
                     }
@@ -96,6 +117,8 @@
                 }
             },
             loadData: async (accessKey) => {
+                if (!isFirebaseAvailable) throw new Error("OFFLINE_MODE (No Config)");
+
                 const user = await authReadyPromise;
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
 
