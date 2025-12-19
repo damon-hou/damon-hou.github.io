@@ -357,13 +357,13 @@
                                         <label className="text-xs text-gray-500 block mb-1">CORS 代理 (選填，解決連線阻擋)</label>
                                         <input 
                                             type="text" 
-                                            placeholder="例如: https://cors-anywhere.herokuapp.com/" 
+                                            placeholder="例如: https://corsproxy.io/?url=" 
                                             value={localApiConfig.corsProxy || ''} 
                                             onChange={e => setLocalApiConfig({...localApiConfig, corsProxy: e.target.value})} 
                                             className="w-full border rounded px-2 py-1.5 text-sm font-mono text-gray-600" 
                                         />
                                         <p className="text-[10px] text-gray-400 mt-1">
-                                            提示：若遇 CORS 錯誤可嘗試使用代理。注意：使用公開代理有安全風險。
+                                            提示：若遇 CORS 錯誤可嘗試使用代理。推薦使用 <code>https://corsproxy.io/?url=</code>。
                                         </p>
                                     </div>
                                 </div>
@@ -657,7 +657,15 @@
                 } catch (e) {
                     console.error("API Error:", e);
                     let title = "API 連線失敗"; let msg = e.message;
-                    if (e.name === 'TypeError' && e.message === 'Failed to fetch') { title = "連線被阻擋 (CORS)"; msg = "瀏覽器安全性限制阻止了連線。\n\n建議：\n1. 在設定中啟用「CORS 代理」。\n2. 使用瀏覽器擴充功能解鎖 CORS。\n3. 下載至本機執行。"; }
+                    if (e.name === 'TypeError' && e.message === 'Failed to fetch') { 
+                        title = "連線被阻擋"; 
+                        msg = "無法連接到伺服器。\n\n";
+                        if (redmineApiConfig.corsProxy) {
+                            msg += "您已啟用 CORS 代理，但請求仍然失敗。\n可能原因：\n1. 代理伺服器不支援 POST 請求或自訂 Header。\n2. 代理伺服器網址錯誤或已失效。\n\n建議：更換代理服務 (如 corsproxy.io) 或下載本機執行。";
+                        } else {
+                            msg += "可能原因：\n1. 跨網域 (CORS) 限制。\n2. 混合內容 (HTTPS 呼叫 HTTP)。\n\n建議：\n- 在設定中啟用「CORS 代理」。\n- 下載至本機執行。";
+                        }
+                    }
                     showAlert(title, msg);
                 } finally { setLoading(false); }
             };
