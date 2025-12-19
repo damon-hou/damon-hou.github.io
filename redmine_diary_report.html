@@ -32,18 +32,39 @@
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
         import { getFirestore, doc, setDoc, getDoc, initializeFirestore } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
 
+        // ==========================================
+        // [本地環境設定區]
+        // 若您下載此檔案在本地執行，請將 Firebase Console 取得的 config 填入下方
+        // ==========================================
+        const localFirebaseConfig = {
+  apiKey: "AIzaSyD5_L45J3r_M0YhOPNhbdl5IkJTWgL1a-8",
+  authDomain: "redmine-diary-report.firebaseapp.com",
+  projectId: "redmine-diary-report",
+  storageBucket: "redmine-diary-report.firebasestorage.app",
+  messagingSenderId: "1024872032156",
+  appId: "1:1024872032156:web:f072756a51d58967244a59"
+        };
+
         let app, auth, db;
         let isFirebaseAvailable = false;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
         // Robust Initialization
         try {
-            // Safe check for __firebase_config
-            const configStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+            let configToUse = null;
+
+            // 1. 優先嘗試讀取雲端環境變數 (Canvas 環境)
+            if (typeof __firebase_config !== 'undefined') {
+                configToUse = JSON.parse(__firebase_config);
+            } 
+            // 2. 若無雲端變數，嘗試讀取本地設定 (Local File)
+            else if (localFirebaseConfig && localFirebaseConfig.apiKey) {
+                configToUse = localFirebaseConfig;
+                console.log("正在使用本地 Firebase 設定...");
+            }
             
-            if (configStr) {
-                const firebaseConfig = JSON.parse(configStr);
-                app = initializeApp(firebaseConfig);
+            if (configToUse) {
+                app = initializeApp(configToUse);
                 auth = getAuth(app);
                 
                 // Force Long Polling for stability
@@ -53,7 +74,7 @@
                 });
                 isFirebaseAvailable = true;
             } else {
-                console.warn("Firebase config not found. Cloud sync will be unavailable.");
+                console.warn("未偵測到 Firebase 設定，雲端同步功能將無法使用 (離線模式)。");
             }
         } catch (e) {
             console.error("Firebase init failed:", e);
@@ -776,7 +797,6 @@
                 if (!window.CloudService) return;
                 setSyncStatus('saving');
                 try {
-                    // Use ref to get latest state, ensuring no stale closures and no dependency on 'tasks' triggering this unless intended
                     const currentState = stateRef.current;
                     const dataToSave = dataOverride || { 
                         userName: currentState.userName, 
