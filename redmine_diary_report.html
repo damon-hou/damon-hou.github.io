@@ -776,6 +776,7 @@
                 if (!window.CloudService) return;
                 setSyncStatus('saving');
                 try {
+                    // Use ref to get latest state, ensuring no stale closures and no dependency on 'tasks' triggering this unless intended
                     const currentState = stateRef.current;
                     const dataToSave = dataOverride || { 
                         userName: currentState.userName, 
@@ -789,10 +790,11 @@
                     setSyncStatus('saved');
                     setLastSyncTime(new Date());
                 } catch (e) { 
-                    console.error("Auto Sync Error:", e);
                     if (e.message.includes('OFFLINE_MODE')) {
+                         console.log("Auto Sync: Running in offline mode."); // Changed from error to log
                          setSyncStatus('offline');
                     } else {
+                         console.error("Auto Sync Error:", e);
                          setSyncStatus('error');
                     }
                 }
