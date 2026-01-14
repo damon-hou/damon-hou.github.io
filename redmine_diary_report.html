@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Redmine 每日工時追蹤器</title>
+    <title>Redmine 工時助手</title>
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -496,19 +496,46 @@
             };
 
             const handleSaveAndClose = async () => {
+                let finalConfigStr = null;
+
                 if (firebaseConfigStr) {
+                    finalConfigStr = firebaseConfigStr;
                     try {
-                        JSON.parse(firebaseConfigStr);
-                        const oldConfig = localStorage.getItem(LS_CONFIG_KEY);
-                        if (oldConfig !== firebaseConfigStr) {
-                            localStorage.setItem(LS_CONFIG_KEY, firebaseConfigStr);
-                            alert("Firebase 設定已更新，頁面將重新整理以套用新設定。");
-                            window.location.reload();
-                            return; 
-                        }
+                        // 1. Try standard JSON first
+                        JSON.parse(finalConfigStr);
                     } catch (e) {
-                        showAlert("設定錯誤", "Firebase 設定格式錯誤 (請輸入有效的 JSON)");
-                        return;
+                        // 2. Try to parse as JS Object (Firebase Console format)
+                        try {
+                            let jsStr = firebaseConfigStr.trim();
+                            // Remove "const firebaseConfig =" if present
+                            if (jsStr.indexOf('=') > -1) {
+                                jsStr = jsStr.substring(jsStr.indexOf('=') + 1).trim();
+                            }
+                            // Remove trailing semicolon
+                            if (jsStr.endsWith(';')) {
+                                jsStr = jsStr.slice(0, -1);
+                            }
+                            
+                            // Use Function constructor to parse JS object string securely in this context
+                            // (Only safe because it's client-side user input)
+                            const obj = new Function("return " + jsStr)();
+                            if (obj && obj.apiKey) {
+                                finalConfigStr = JSON.stringify(obj);
+                            } else {
+                                throw new Error("Invalid Config");
+                            }
+                        } catch (e2) {
+                             showAlert("設定錯誤", "Firebase 設定格式錯誤 (請輸入有效的 JSON 或直接貼上 Firebase Console 的程式碼)");
+                             return;
+                        }
+                    }
+
+                    const oldConfig = localStorage.getItem(LS_CONFIG_KEY);
+                    if (oldConfig !== finalConfigStr) {
+                        localStorage.setItem(LS_CONFIG_KEY, finalConfigStr);
+                        alert("Firebase 設定已更新，頁面將重新整理以套用新設定。");
+                        window.location.reload();
+                        return; 
                     }
                 }
 
