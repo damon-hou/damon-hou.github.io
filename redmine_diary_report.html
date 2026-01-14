@@ -148,7 +148,6 @@
         const { useState, useEffect, useRef, useCallback, useLayoutEffect } = React;
 
         const FIXED_ACCESS_KEY = 'redmine_diary_report';
-        // Re-defined here to be accessible in React scope
         const LS_CONFIG_KEY = 'redmine_firebase_config_v2';
 
         // --- Helper: Strip HTML ---
@@ -496,31 +495,36 @@
             };
 
             const handleSaveAndClose = async () => {
-                let finalConfigStr = null;
-
                 if (firebaseConfigStr) {
-                    finalConfigStr = firebaseConfigStr;
                     try {
-                        // 1. Try standard JSON first
-                        JSON.parse(finalConfigStr);
+                        JSON.parse(firebaseConfigStr);
+                        const oldConfig = localStorage.getItem(LS_CONFIG_KEY);
+                        if (oldConfig !== firebaseConfigStr) {
+                            localStorage.setItem(LS_CONFIG_KEY, firebaseConfigStr);
+                            alert("Firebase 設定已更新，頁面將重新整理以套用新設定。");
+                            window.location.reload();
+                            return; 
+                        }
                     } catch (e) {
-                        // 2. Try to parse as JS Object (Firebase Console format)
                         try {
                             let jsStr = firebaseConfigStr.trim();
-                            // Remove "const firebaseConfig =" if present
                             if (jsStr.indexOf('=') > -1) {
                                 jsStr = jsStr.substring(jsStr.indexOf('=') + 1).trim();
                             }
-                            // Remove trailing semicolon
                             if (jsStr.endsWith(';')) {
                                 jsStr = jsStr.slice(0, -1);
                             }
                             
-                            // Use Function constructor to parse JS object string securely in this context
-                            // (Only safe because it's client-side user input)
                             const obj = new Function("return " + jsStr)();
                             if (obj && obj.apiKey) {
-                                finalConfigStr = JSON.stringify(obj);
+                                const finalConfigStr = JSON.stringify(obj);
+                                const oldConfig = localStorage.getItem(LS_CONFIG_KEY);
+                                if (oldConfig !== finalConfigStr) {
+                                    localStorage.setItem(LS_CONFIG_KEY, finalConfigStr);
+                                    alert("Firebase 設定已更新，頁面將重新整理以套用新設定。");
+                                    window.location.reload();
+                                    return; 
+                                }
                             } else {
                                 throw new Error("Invalid Config");
                             }
@@ -528,14 +532,6 @@
                              showAlert("設定錯誤", "Firebase 設定格式錯誤 (請輸入有效的 JSON 或直接貼上 Firebase Console 的程式碼)");
                              return;
                         }
-                    }
-
-                    const oldConfig = localStorage.getItem(LS_CONFIG_KEY);
-                    if (oldConfig !== finalConfigStr) {
-                        localStorage.setItem(LS_CONFIG_KEY, finalConfigStr);
-                        alert("Firebase 設定已更新，頁面將重新整理以套用新設定。");
-                        window.location.reload();
-                        return; 
                     }
                 }
 
@@ -1012,6 +1008,145 @@
             );
         };
 
+        // --- Redmine Gap Filler Component ---
+        const RedmineGapFiller = ({ gapHours, date, onSuccess, showAlert, staticData, redmineApiConfig, setRedmineApiConfig, state, setState }) => {
+            const { subject, description, doneRatio, enabled } = state;
+            const [loading, setLoading] = useState(false); 
+            const [createLog, setCreateLog] = useState(true); 
+            
+            const updateField = (field, value) => {
+                setState(prev => ({ ...prev, [field]: value }));
+            };
+
+            const updateConfig = (key, val) => setRedmineApiConfig(prev => ({ ...prev, [key]: val }));
+
+            // Helper to get fetch URL (apply proxy if needed)
+            const getFetchUrl = (url, config) => {
+                let target = url;
+                if (config.corsProxy) {
+                    if (config.corsProxy.trim().endsWith('=')) {
+                        return config.corsProxy + encodeURIComponent(target);
+                    }
+                    return config.corsProxy + target;
+                }
+                return target;
+            };
+
+            const handleCreate = async () => {
+                if (!redmineApiConfig.host || !redmineApiConfig.apiKey) return showAlert("錯誤", "請先至右上角「設定」填寫 Redmine URL 與 API Key");
+                if (!redmineApiConfig.projectId) return showAlert("錯誤", "請選擇專案");
+
+                setLoading(true);
+                let baseUrl = redmineApiConfig.host.trim().replace(/\/$/, '');
+                if (!/^https?:\/\//i.test(baseUrl)) baseUrl = 'https://' + baseUrl;
+                
+                try {
+                    const issuePayload = { issue: { project_id: redmineApiConfig.projectId, tracker_id: redmineApiConfig.trackerId, subject: subject, description: description, done_ratio: doneRatio } };
+                    
+                    // Append key to URL
+                    let issueUrl = `${baseUrl}/issues.json`;
+                    if (issueUrl.includes('?')) issueUrl += `&key=${redmineApiConfig.apiKey}`;
+                    else issueUrl += `?key=${redmineApiConfig.apiKey}`;
+
+                    const finalIssueUrl = getFetchUrl(issueUrl, redmineApiConfig);
+                    
+                    const issueRes = await fetch(finalIssueUrl, { 
+                        method: 'POST', 
+                        headers: { 'Content-Type': 'application/json' }, 
+                        body: JSON.stringify(issuePayload) 
+                    });
+                    
+                    if (!issueRes.ok) throw new Error(`建立 Issue 失敗: ${issueRes.status} ${issueRes.statusText}`);
+                    const issueData = await issueRes.json();
+                    const newIssueId = issueData.issue.id;
+                    let successMsg = `成功建立 Issue #${newIssueId}！`;
+
+                    if (createLog) {
+                        if (!redmineApiConfig.timeActivityId) throw new Error("回報工時需填寫工時活動 ID");
+                        
+                        let timeUrl = `${baseUrl}/time_entries.json`;
+                        if (timeUrl.includes('?')) timeUrl += `&key=${redmineApiConfig.apiKey}`;
+                        else timeUrl += `?key=${redmineApiConfig.apiKey}`;
+
+                        const finalTimeUrl = getFetchUrl(timeUrl, redmineApiConfig);
+                        
+                        const timeRes = await fetch(finalTimeUrl, { 
+                            method: 'POST', 
+                            headers: { 'Content-Type': 'application/json' }, 
+                            body: JSON.stringify({ time_entry: { issue_id: newIssueId, hours: gapHours, activity_id: redmineApiConfig.timeActivityId, spent_on: date, comments: '系統自動補單' } }) 
+                        });
+                        
+                        if (!timeRes.ok) throw new Error(`工時回報失敗: ${timeRes.status}`);
+                        successMsg += `\n並已寫入 ${gapHours} 小時工時。`;
+                    }
+                    showAlert("成功", successMsg);
+                    if (onSuccess) onSuccess(newIssueId, gapHours);
+                } catch (e) {
+                    console.error("API Error:", e);
+                    let title = "API 連線失敗"; let msg = e.message;
+                    if (e.name === 'TypeError' && e.message === 'Failed to fetch') { 
+                        title = "連線被阻擋"; 
+                        msg = "無法連接到伺服器。\n\n";
+                        if (redmineApiConfig.corsProxy) {
+                            msg += "您已啟用 CORS 代理，但請求仍然失敗。\n可能原因：\n1. 代理伺服器不支援 POST 請求或自訂 Header。\n2. 代理伺服器網址錯誤或已失效。\n\n建議：更換代理服務 (如 corsproxy.io) 或下載本機執行。";
+                        } else {
+                            msg += "可能原因：\n1. 跨網域 (CORS) 限制。\n2. 混合內容 (HTTPS 呼叫 HTTP)。\n\n建議：\n- 在設定中啟用「CORS 代理」。\n- 下載至本機執行。";
+                        }
+                    }
+                    showAlert(title, msg);
+                } finally { setLoading(false); }
+            };
+
+            const hasStaticData = staticData.projects.length > 0 || staticData.trackers.length > 0;
+
+            return (
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 mb-6 shadow-sm text-sm">
+                    <div className="flex items-center justify-between mb-4">
+                        <div className="flex items-center gap-2 text-orange-800 font-bold text-base">
+                            <Icon name="alert-circle" size={20} />
+                            <span>工時不足 {gapHours} 小時</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                             <input 
+                                type="checkbox" 
+                                id="enableGapFiller"
+                                checked={enabled}
+                                onChange={(e) => updateField('enabled', e.target.checked)}
+                                className="rounded text-orange-600 focus:ring-orange-500 w-4 h-4"
+                             />
+                             <label htmlFor="enableGapFiller" className="font-bold text-gray-700 cursor-pointer select-none">啟用自動補單</label>
+                        </div>
+                    </div>
+                    
+                    {enabled && (
+                        <div className="animate-fade-in">
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                <div className="space-y-3 p-3 bg-orange-100/50 rounded-lg border border-orange-100">
+                                    <div className="flex justify-between items-center"><label className="block font-bold text-orange-900 flex items-center gap-1"><Icon name="settings-2" size={14} /> Redmine 設定</label>{hasStaticData && <span className="text-xs text-green-600 bg-green-100 px-2 py-0.5 rounded">已載入設定資料</span>}</div>
+                                    {(!redmineApiConfig.host || !redmineApiConfig.apiKey) && <div className="text-xs text-red-600 bg-red-50 p-2 rounded border border-red-200"><Icon name="alert-triangle" size={12} className="inline mr-1"/>請點擊右上角「設定」按鈕，填寫 Redmine 網址與 API Key。</div>}
+                                    <SearchableSelect label="專案 (Project)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.projectId} onChange={(val) => updateConfig('projectId', val)} options={staticData.projects} emptyText="無資料，請至設定匯入 API" />
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <SearchableSelect label="追蹤標籤 (Tracker)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.trackerId} onChange={(val) => updateConfig('trackerId', val)} options={staticData.trackers} emptyText="無資料，請至設定匯入 API" />
+                                        <SearchableSelect label="工時-活動類型 (Activity)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.timeActivityId} onChange={(val) => updateConfig('timeActivityId', val)} options={staticData.activities} emptyText="無資料，請至設定匯入 API" />
+                                    </div>
+                                </div>
+                                <div className="space-y-3 p-3 bg-white rounded-lg border border-gray-200">
+                                    <label className="block font-bold text-gray-700 flex items-center gap-1"><Icon name="file-plus" size={14} /> 補單內容</label>
+                                    <div><label className="text-xs text-gray-500 mb-0.5 block">主旨</label><input type="text" placeholder="主旨" value={subject} onChange={e=>updateField('subject', e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none" /></div>
+                                    <div><label className="text-xs text-gray-500 mb-0.5 block">概述</label><textarea placeholder="概述" rows={4} value={description} onChange={e=>updateField('description', e.target.value)} className="w-full border rounded px-2 py-1.5 resize-none focus:border-orange-500 outline-none" /></div>
+                                    <div><label className="text-xs text-gray-500 mb-0.5 block">完成百分比</label><select value={doneRatio} onChange={e=>updateField('doneRatio', e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none bg-white">{[0,10,20,30,40,50,60,70,80,90,100].map(r => <option key={r} value={r}>{r}%</option>)}</select></div>
+                                </div>
+                            </div>
+                            <div className="flex items-center justify-between pt-3 border-t border-orange-200">
+                                <label className="flex items-center gap-2 text-gray-700 cursor-pointer select-none font-medium"><input type="checkbox" checked={createLog} onChange={e=>setCreateLog(e.target.checked)} className="rounded text-orange-600 focus:ring-orange-500" /><span>同時回報工時 (Log Time)</span></label>
+                                <button onClick={handleCreate} disabled={loading} className="bg-orange-600 hover:bg-orange-700 text-white px-6 py-2.5 rounded-lg font-bold flex items-center gap-2 disabled:opacity-50 transition-colors shadow-sm">{loading ? <Icon name="loader-2" className="animate-spin" size={18} /> : <Icon name="send" size={18} />}{loading ? "處理中..." : "建立單據"}</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
         // --- Daily Activity Panel ---
         const DailyActivityPanel = ({ date, redmineApiConfig, redmineUserId, onAddTask, showAlert, staticData, localUserName, onBatchAdd }) => {
             const [activities, setActivities] = useState([]);
@@ -1045,10 +1180,7 @@
                     return;
                 }
                 
-                if (!redmineUserId) {
-                    showAlert("提示", "尚未取得用戶 ID。\n請至「設定」>「個人設定」點擊「從 Redmine 載入」，以獲取您的 User ID 用於篩選日記。");
-                    return;
-                }
+                // UNSEALED: Allow searching even if user ID is missing, but show alert if needed inside
                 
                 setLoading(true);
                 setProgress(null);
@@ -1274,7 +1406,13 @@
                     
                     console.log(`[RedmineDebug] Final Results: ${results.length}`, results);
                     setActivities(results);
-                    if (results.length === 0) showAlert("提示", "該日期沒有找到您參與並留言的議題。");
+                    if (results.length === 0) {
+                         if (!redmineUserId) {
+                             showAlert("提示", "搜尋完成，但未找到結果。\n\n注意：系統尚未取得您的 User ID，因此無法篩選出「您」的足跡。\n請至「設定 > 個人設定」點擊「從 Redmine 載入」。");
+                         } else {
+                             showAlert("提示", "該日期沒有找到您參與並留言/修改的議題。");
+                         }
+                    }
 
                 } catch (e) {
                     console.error(e);
@@ -1346,8 +1484,8 @@
                                 </h3>
                                 <button 
                                     onClick={fetchActivities} 
-                                    disabled={loading || !redmineUserId}
-                                    className="text-xs bg-indigo-50 text-indigo-600 px-2 py-1 rounded hover:bg-indigo-100 transition-colors flex items-center gap-1"
+                                    disabled={loading}
+                                    className={`text-xs px-2 py-1 rounded transition-colors flex items-center gap-1 ${loading ? 'bg-gray-100 text-gray-400' : 'bg-indigo-50 text-indigo-600 hover:bg-indigo-100'}`}
                                 >
                                     {loading ? <Icon name="loader-2" className="animate-spin" size={12} /> : <Icon name="search" size={12} />}
                                     {loading ? '搜尋中...' : '搜尋'}
@@ -1518,145 +1656,6 @@
             );
         };
 
-        // --- Redmine Gap Filler Component ---
-        const RedmineGapFiller = ({ gapHours, date, onSuccess, showAlert, staticData, redmineApiConfig, setRedmineApiConfig, state, setState }) => {
-            const { subject, description, doneRatio, enabled } = state;
-            const [loading, setLoading] = useState(false); // Add missing state
-            const [createLog, setCreateLog] = useState(true); // Add missing state
-            
-            const updateField = (field, value) => {
-                setState(prev => ({ ...prev, [field]: value }));
-            };
-
-            const updateConfig = (key, val) => setRedmineApiConfig(prev => ({ ...prev, [key]: val }));
-
-            // Helper to get fetch URL (apply proxy if needed)
-            const getFetchUrl = (url, config) => {
-                let target = url;
-                if (config.corsProxy) {
-                    if (config.corsProxy.trim().endsWith('=')) {
-                        return config.corsProxy + encodeURIComponent(target);
-                    }
-                    return config.corsProxy + target;
-                }
-                return target;
-            };
-
-            const handleCreate = async () => {
-                if (!redmineApiConfig.host || !redmineApiConfig.apiKey) return showAlert("錯誤", "請先至右上角「設定」填寫 Redmine URL 與 API Key");
-                if (!redmineApiConfig.projectId) return showAlert("錯誤", "請選擇專案");
-
-                setLoading(true);
-                let baseUrl = redmineApiConfig.host.trim().replace(/\/$/, '');
-                if (!/^https?:\/\//i.test(baseUrl)) baseUrl = 'https://' + baseUrl;
-                
-                try {
-                    const issuePayload = { issue: { project_id: redmineApiConfig.projectId, tracker_id: redmineApiConfig.trackerId, subject: subject, description: description, done_ratio: doneRatio } };
-                    
-                    // Append key to URL
-                    let issueUrl = `${baseUrl}/issues.json`;
-                    if (issueUrl.includes('?')) issueUrl += `&key=${redmineApiConfig.apiKey}`;
-                    else issueUrl += `?key=${redmineApiConfig.apiKey}`;
-
-                    const finalIssueUrl = getFetchUrl(issueUrl, redmineApiConfig);
-                    
-                    const issueRes = await fetch(finalIssueUrl, { 
-                        method: 'POST', 
-                        headers: { 'Content-Type': 'application/json' }, 
-                        body: JSON.stringify(issuePayload) 
-                    });
-                    
-                    if (!issueRes.ok) throw new Error(`建立 Issue 失敗: ${issueRes.status} ${issueRes.statusText}`);
-                    const issueData = await issueRes.json();
-                    const newIssueId = issueData.issue.id;
-                    let successMsg = `成功建立 Issue #${newIssueId}！`;
-
-                    if (createLog) {
-                        if (!redmineApiConfig.timeActivityId) throw new Error("回報工時需填寫工時活動 ID");
-                        
-                        let timeUrl = `${baseUrl}/time_entries.json`;
-                        if (timeUrl.includes('?')) timeUrl += `&key=${redmineApiConfig.apiKey}`;
-                        else timeUrl += `?key=${redmineApiConfig.apiKey}`;
-
-                        const finalTimeUrl = getFetchUrl(timeUrl, redmineApiConfig);
-                        
-                        const timeRes = await fetch(finalTimeUrl, { 
-                            method: 'POST', 
-                            headers: { 'Content-Type': 'application/json' }, 
-                            body: JSON.stringify({ time_entry: { issue_id: newIssueId, hours: gapHours, activity_id: redmineApiConfig.timeActivityId, spent_on: date, comments: '系統自動補單' } }) 
-                        });
-                        
-                        if (!timeRes.ok) throw new Error(`工時回報失敗: ${timeRes.status}`);
-                        successMsg += `\n並已寫入 ${gapHours} 小時工時。`;
-                    }
-                    showAlert("成功", successMsg);
-                    if (onSuccess) onSuccess(newIssueId, gapHours);
-                } catch (e) {
-                    console.error("API Error:", e);
-                    let title = "API 連線失敗"; let msg = e.message;
-                    if (e.name === 'TypeError' && e.message === 'Failed to fetch') { 
-                        title = "連線被阻擋"; 
-                        msg = "無法連接到伺服器。\n\n";
-                        if (redmineApiConfig.corsProxy) {
-                            msg += "您已啟用 CORS 代理，但請求仍然失敗。\n可能原因：\n1. 代理伺服器不支援 POST 請求或自訂 Header。\n2. 代理伺服器網址錯誤或已失效。\n\n建議：更換代理服務 (如 corsproxy.io) 或下載本機執行。";
-                        } else {
-                            msg += "可能原因：\n1. 跨網域 (CORS) 限制。\n2. 混合內容 (HTTPS 呼叫 HTTP)。\n\n建議：\n- 在設定中啟用「CORS 代理」。\n- 下載至本機執行。";
-                        }
-                    }
-                    showAlert(title, msg);
-                } finally { setLoading(false); }
-            };
-
-            const hasStaticData = staticData.projects.length > 0 || staticData.trackers.length > 0;
-
-            return (
-                <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 mb-6 shadow-sm text-sm">
-                    <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center gap-2 text-orange-800 font-bold text-base">
-                            <Icon name="alert-circle" size={20} />
-                            <span>工時不足 {gapHours} 小時</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                             <input 
-                                type="checkbox" 
-                                id="enableGapFiller"
-                                checked={enabled}
-                                onChange={(e) => updateField('enabled', e.target.checked)}
-                                className="rounded text-orange-600 focus:ring-orange-500 w-4 h-4"
-                             />
-                             <label htmlFor="enableGapFiller" className="font-bold text-gray-700 cursor-pointer select-none">啟用自動補單</label>
-                        </div>
-                    </div>
-                    
-                    {enabled && (
-                        <div className="animate-fade-in">
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                                <div className="space-y-3 p-3 bg-orange-100/50 rounded-lg border border-orange-100">
-                                    <div className="flex justify-between items-center"><label className="block font-bold text-orange-900 flex items-center gap-1"><Icon name="settings-2" size={14} /> Redmine 設定</label>{hasStaticData && <span className="text-xs text-green-600 bg-green-100 px-2 py-0.5 rounded">已載入設定資料</span>}</div>
-                                    {(!redmineApiConfig.host || !redmineApiConfig.apiKey) && <div className="text-xs text-red-600 bg-red-50 p-2 rounded border border-red-200"><Icon name="alert-triangle" size={12} className="inline mr-1"/>請點擊右上角「設定」按鈕，填寫 Redmine 網址與 API Key。</div>}
-                                    <SearchableSelect label="專案 (Project)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.projectId} onChange={(val) => updateConfig('projectId', val)} options={staticData.projects} emptyText="無資料，請至設定匯入 API" />
-                                    <div className="grid grid-cols-2 gap-2">
-                                        <SearchableSelect label="追蹤標籤 (Tracker)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.trackerId} onChange={(val) => updateConfig('trackerId', val)} options={staticData.trackers} emptyText="無資料，請至設定匯入 API" />
-                                        <SearchableSelect label="工時-活動類型 (Activity)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.timeActivityId} onChange={(val) => updateConfig('timeActivityId', val)} options={staticData.activities} emptyText="無資料，請至設定匯入 API" />
-                                    </div>
-                                </div>
-                                <div className="space-y-3 p-3 bg-white rounded-lg border border-gray-200">
-                                    <label className="block font-bold text-gray-700 flex items-center gap-1"><Icon name="file-plus" size={14} /> 補單內容</label>
-                                    <div><label className="text-xs text-gray-500 mb-0.5 block">主旨</label><input type="text" placeholder="主旨" value={subject} onChange={e=>updateField('subject', e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none" /></div>
-                                    <div><label className="text-xs text-gray-500 mb-0.5 block">概述</label><textarea placeholder="概述" rows={4} value={description} onChange={e=>updateField('description', e.target.value)} className="w-full border rounded px-2 py-1.5 resize-none focus:border-orange-500 outline-none" /></div>
-                                    <div><label className="text-xs text-gray-500 mb-0.5 block">完成百分比</label><select value={doneRatio} onChange={e=>updateField('doneRatio', e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none bg-white">{[0,10,20,30,40,50,60,70,80,90,100].map(r => <option key={r} value={r}>{r}%</option>)}</select></div>
-                                </div>
-                            </div>
-                            <div className="flex items-center justify-between pt-3 border-t border-orange-200">
-                                <label className="flex items-center gap-2 text-gray-700 cursor-pointer select-none font-medium"><input type="checkbox" checked={createLog} onChange={e=>setCreateLog(e.target.checked)} className="rounded text-orange-600 focus:ring-orange-500" /><span>同時回報工時 (Log Time)</span></label>
-                                <button onClick={handleCreate} disabled={loading} className="bg-orange-600 hover:bg-orange-700 text-white px-6 py-2.5 rounded-lg font-bold flex items-center gap-2 disabled:opacity-50 transition-colors shadow-sm">{loading ? <Icon name="loader-2" className="animate-spin" size={18} /> : <Icon name="send" size={18} />}{loading ? "處理中..." : "建立單據"}</button>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            );
-        };
-
         // --- App Component ---
         const App = () => {
             const [tasks, setTasks] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_tasks') || '[]').map(t => ({...t, isRunning: false})); } catch { return []; } });
@@ -1713,9 +1712,6 @@
             
             const stateRef = useRef({ tasks, userName, globalDate, workSettings, staticData, redmineApiConfig });
             useEffect(() => { stateRef.current = { tasks, userName, globalDate, workSettings, staticData, redmineApiConfig }; }, [tasks, userName, globalDate, workSettings, staticData, redmineApiConfig]);
-            
-            // Work Settings Default
-            // const [workSettings, setWorkSettings] = useState defined above
 
             // Persistence LocalStorage
             useEffect(() => localStorage.setItem('redmine_user_v2', userName), [userName]);
