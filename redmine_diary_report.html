@@ -33,29 +33,28 @@
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
         import { getFirestore, doc, setDoc, getDoc, initializeFirestore } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
 
-        // ==========================================
-        // [本地環境設定區] - 請務必替換為您自己的 Firebase 設定
-        // ==========================================
-        const localFirebaseConfig = {
-            apiKey: "AIzaSyD5_L45J3r_M0YhOPNhbdl5IkJTWgL1a-8",
-            authDomain: "redmine-diary-report.firebaseapp.com",
-            projectId: "redmine-diary-report",
-            storageBucket: "redmine-diary-report.firebasestorage.app",
-            messagingSenderId: "1024872032156",
-            appId: "1:1024872032156:web:f072756a51d58967244a59"
-        };
-
         let app, auth, db;
         let isFirebaseAvailable = false;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const LS_CONFIG_KEY = 'redmine_firebase_config_v2';
 
-        // Robust Initialization
+        // Initialization Logic
         try {
             let configToUse = null;
-            if (typeof __firebase_config !== 'undefined') {
+            // 1. Try LocalStorage (User Setting)
+            const localConfigStr = localStorage.getItem(LS_CONFIG_KEY);
+            if (localConfigStr) {
+                try {
+                    configToUse = JSON.parse(localConfigStr);
+                    console.log("Loaded Firebase config from LocalStorage");
+                } catch(e) {
+                    console.error("Invalid JSON in LocalStorage", e);
+                }
+            } 
+            // 2. Try Environment Variable (Fallback)
+            else if (typeof __firebase_config !== 'undefined') {
                 configToUse = JSON.parse(__firebase_config);
-            } else if (localFirebaseConfig && localFirebaseConfig.apiKey) {
-                configToUse = localFirebaseConfig;
+                console.log("Loaded Firebase config from Environment");
             }
             
             if (configToUse) {
@@ -110,13 +109,14 @@
         };
 
         window.CloudService = {
+            isAvailable: () => isFirebaseAvailable,
             saveData: async (accessKey, data) => {
                 if (!isFirebaseAvailable) throw new Error("OFFLINE_MODE (No Config)");
                 const user = await authReadyPromise;
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 try {
                     await retryOperation(async () => {
-                        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'redmine_timer_v3', accessKey);
+                        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'redmine_timer_v3', accessKey);
                         await setDoc(docRef, { ...data, updatedAt: new Date().toISOString(), savedBy: user.uid }, { merge: true });
                     });
                 } catch (e) {
@@ -130,10 +130,10 @@
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 try {
                     return await retryOperation(async () => {
-                        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'redmine_timer_v3', accessKey);
+                        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'redmine_timer_v3', accessKey);
                         const docSnap = await getDoc(docRef);
                         if (docSnap.exists()) return docSnap.data();
-                        throw new Error("找不到此金鑰的備份資料");
+                        return null;
                     });
                 } catch (e) {
                     if (e.code === 'unavailable' || e.message.includes('offline')) throw new Error("OFFLINE_MODE");
@@ -148,22 +148,19 @@
         const { useState, useEffect, useRef, useCallback, useLayoutEffect } = React;
 
         const FIXED_ACCESS_KEY = 'redmine_diary_report';
+        // Re-defined here to be accessible in React scope
+        const LS_CONFIG_KEY = 'redmine_firebase_config_v2';
 
-        // --- Helper: Strip HTML & Clean Newlines ---
+        // --- Helper: Strip HTML ---
         const stripHtml = (html) => {
             if (!html) return "";
-            // Replace common block/break tags with newlines
             let text = html.replace(/<br\s*\/?>/gi, '\n')
                            .replace(/<\/p>/gi, '\n')
                            .replace(/<\/li>/gi, '\n')
                            .replace(/<\/div>/gi, '\n');
-            
-            // Create a temporary element to extract text
             const temp = document.createElement("div");
             temp.innerHTML = text;
             text = temp.textContent || temp.innerText || "";
-            
-            // Collapse excessive newlines (max 2 consecutive newlines) and trim
             return text.replace(/(\r\n|\n|\r){3,}/g, '\n\n').trim();
         };
 
@@ -226,6 +223,7 @@
             const [localUserName, setLocalUserName] = useState(userName);
             const [isFetching, setIsFetching] = useState({ projects: false, trackers: false, activities: false, user: false });
             
+            const [firebaseConfigStr, setFirebaseConfigStr] = useState('');
             const [projectsJson, setProjectsJson] = useState('');
             const [trackersJson, setTrackersJson] = useState('');
             const [activitiesJson, setActivitiesJson] = useState('');
@@ -235,6 +233,11 @@
                     setLocalWork(workSettings);
                     setLocalApiConfig(redmineApiConfig);
                     setLocalUserName(userName);
+                    
+                    const storedConfig = localStorage.getItem(LS_CONFIG_KEY);
+                    if (storedConfig) {
+                        setFirebaseConfigStr(storedConfig);
+                    }
                 } 
             }, [isOpen, workSettings, redmineApiConfig, userName]);
 
@@ -251,12 +254,10 @@
                 let url = rawUrl.trim();
                 let key = localApiConfig.apiKey ? localApiConfig.apiKey.trim() : '';
 
-                // 1. Replace placeholders (Robust Regex)
                 if (key) {
                     url = url.replace(/\{(?:\s*key|api_?key|密鑰)\s*\}/gi, key);
                 }
                 
-                // 2. Handle Relative Paths and Host
                 if (url.startsWith('/')) {
                     if (localApiConfig.host) {
                         let host = localApiConfig.host.trim().replace(/\/$/, '');
@@ -267,13 +268,11 @@
                     url = 'https://' + url;
                 }
 
-                // 3. Auto-append key if missing and key exists (Crucial for Proxy!)
                 if (key && !url.includes('key=') && !url.includes(key)) {
                     const separator = url.includes('?') ? '&' : '?';
                     url = `${url}${separator}key=${key}`;
                 }
 
-                // 4. Apply Proxy (Encode the WHOLE url including key)
                 if (localApiConfig.corsProxy) {
                     let proxy = localApiConfig.corsProxy.trim();
                     if (proxy.endsWith('=')) {
@@ -497,12 +496,27 @@
             };
 
             const handleSaveAndClose = async () => {
+                if (firebaseConfigStr) {
+                    try {
+                        JSON.parse(firebaseConfigStr);
+                        const oldConfig = localStorage.getItem(LS_CONFIG_KEY);
+                        if (oldConfig !== firebaseConfigStr) {
+                            localStorage.setItem(LS_CONFIG_KEY, firebaseConfigStr);
+                            alert("Firebase 設定已更新，頁面將重新整理以套用新設定。");
+                            window.location.reload();
+                            return; 
+                        }
+                    } catch (e) {
+                        showAlert("設定錯誤", "Firebase 設定格式錯誤 (請輸入有效的 JSON)");
+                        return;
+                    }
+                }
+
                 let fetchedName = null;
                 
-                // Attempt to fetch user info if API key is present
                 if (localApiConfig.apiKey && localApiConfig.host) {
                     try {
-                        fetchedName = await handleFetchUser(true); // Silent fetch
+                        fetchedName = await handleFetchUser(true);
                     } catch (e) {
                         console.error("Auto fetch user failed on save:", e);
                     }
@@ -544,7 +558,7 @@
                                                 syncStatus === 'error' ? 'text-red-600' : 'text-blue-600'}`}>
                                                 {syncStatus === 'saved' ? '已同步' : 
                                                  syncStatus === 'saving' ? '同步中...' : 
-                                                 syncStatus === 'offline' ? '暫時離線 (資料存於本地)' :
+                                                 syncStatus === 'offline' ? '暫時離線' :
                                                  syncStatus === 'error' ? '同步失敗' : '等待中'}
                                             </span>
                                         </div>
@@ -552,9 +566,20 @@
                                             {lastSyncTime ? new Date(lastSyncTime).toLocaleTimeString() : '尚未同步'}
                                         </div>
                                     </div>
-                                    <div className="text-xs text-gray-400 font-mono break-all">
-                                        Key: {FIXED_ACCESS_KEY}
+                                    
+                                    <div className="mt-2">
+                                        <label className="text-xs text-gray-500 block mb-1">Firebase 設定 (JSON)</label>
+                                        <textarea
+                                            value={firebaseConfigStr}
+                                            onChange={e => setFirebaseConfigStr(e.target.value)}
+                                            placeholder='請貼上 Firebase Config JSON: { "apiKey": "...", ... }'
+                                            className="w-full border rounded px-2 py-1.5 text-xs font-mono h-20 resize-y focus:border-blue-500 outline-none"
+                                        />
+                                        <p className="text-[10px] text-gray-400 mt-1">
+                                            若未填寫，將無法使用雲端同步功能。設定後請點擊儲存，系統將自動重整。
+                                        </p>
                                     </div>
+
                                     <div className="flex gap-2 justify-end mt-1">
                                         <button 
                                             onClick={handleForceBackup}
@@ -933,8 +958,6 @@
         const TaskTextarea = ({ value, onChange }) => {
             const textareaRef = useRef(null);
             
-            // 使用 useLayoutEffect 確保在繪製前更新高度，避免閃爍
-            // 並加入 setTimeout(0) 確保在 DOM 更新週期後強制重算
             useEffect(() => {
                 const adjustHeight = () => {
                     if (textareaRef.current) {
@@ -1121,7 +1144,7 @@
                                  for (const chunk of projectChunks) {
                                      const promises = chunk.map(p => {
                                          // Also reduce limit here and add nometa
-                                         const url = `${finalBaseUrl}/issues.json?project_id=${p.id}&updated_on=${date}&status_id=*&limit=50&nometa=1&key=${redmineApiConfig.apiKey}`;
+                                         const url = `${finalBaseUrl}/issues.json?project_id=${p.id}&updated_on=${date}&status_id=*&limit=100&nometa=1&key=${redmineApiConfig.apiKey}`;
                                          console.log(`[RedmineDebug] Scanning Project: ${p.name} URL: ${url.replace(/key=([^&]+)/, 'key=***')}`);
                                          return fetchWithRetry(getFetchUrl(appendKey(url)), 
                                              { headers: { 'X-Redmine-API-Key': redmineApiConfig.apiKey } }
@@ -1471,12 +1494,93 @@
         // --- Redmine Gap Filler Component ---
         const RedmineGapFiller = ({ gapHours, date, onSuccess, showAlert, staticData, redmineApiConfig, setRedmineApiConfig, state, setState }) => {
             const { subject, description, doneRatio, enabled } = state;
+            const [loading, setLoading] = useState(false); // Add missing state
+            const [createLog, setCreateLog] = useState(true); // Add missing state
             
             const updateField = (field, value) => {
                 setState(prev => ({ ...prev, [field]: value }));
             };
 
             const updateConfig = (key, val) => setRedmineApiConfig(prev => ({ ...prev, [key]: val }));
+
+            // Helper to get fetch URL (apply proxy if needed)
+            const getFetchUrl = (url, config) => {
+                let target = url;
+                if (config.corsProxy) {
+                    if (config.corsProxy.trim().endsWith('=')) {
+                        return config.corsProxy + encodeURIComponent(target);
+                    }
+                    return config.corsProxy + target;
+                }
+                return target;
+            };
+
+            const handleCreate = async () => {
+                if (!redmineApiConfig.host || !redmineApiConfig.apiKey) return showAlert("錯誤", "請先至右上角「設定」填寫 Redmine URL 與 API Key");
+                if (!redmineApiConfig.projectId) return showAlert("錯誤", "請選擇專案");
+
+                setLoading(true);
+                let baseUrl = redmineApiConfig.host.trim().replace(/\/$/, '');
+                if (!/^https?:\/\//i.test(baseUrl)) baseUrl = 'https://' + baseUrl;
+                
+                try {
+                    const issuePayload = { issue: { project_id: redmineApiConfig.projectId, tracker_id: redmineApiConfig.trackerId, subject: subject, description: description, done_ratio: doneRatio } };
+                    
+                    // Append key to URL
+                    let issueUrl = `${baseUrl}/issues.json`;
+                    if (issueUrl.includes('?')) issueUrl += `&key=${redmineApiConfig.apiKey}`;
+                    else issueUrl += `?key=${redmineApiConfig.apiKey}`;
+
+                    const finalIssueUrl = getFetchUrl(issueUrl, redmineApiConfig);
+                    
+                    const issueRes = await fetch(finalIssueUrl, { 
+                        method: 'POST', 
+                        headers: { 'Content-Type': 'application/json' }, 
+                        body: JSON.stringify(issuePayload) 
+                    });
+                    
+                    if (!issueRes.ok) throw new Error(`建立 Issue 失敗: ${issueRes.status} ${issueRes.statusText}`);
+                    const issueData = await issueRes.json();
+                    const newIssueId = issueData.issue.id;
+                    let successMsg = `成功建立 Issue #${newIssueId}！`;
+
+                    if (createLog) {
+                        if (!redmineApiConfig.timeActivityId) throw new Error("回報工時需填寫工時活動 ID");
+                        
+                        let timeUrl = `${baseUrl}/time_entries.json`;
+                        if (timeUrl.includes('?')) timeUrl += `&key=${redmineApiConfig.apiKey}`;
+                        else timeUrl += `?key=${redmineApiConfig.apiKey}`;
+
+                        const finalTimeUrl = getFetchUrl(timeUrl, redmineApiConfig);
+                        
+                        const timeRes = await fetch(finalTimeUrl, { 
+                            method: 'POST', 
+                            headers: { 'Content-Type': 'application/json' }, 
+                            body: JSON.stringify({ time_entry: { issue_id: newIssueId, hours: gapHours, activity_id: redmineApiConfig.timeActivityId, spent_on: date, comments: '系統自動補單' } }) 
+                        });
+                        
+                        if (!timeRes.ok) throw new Error(`工時回報失敗: ${timeRes.status}`);
+                        successMsg += `\n並已寫入 ${gapHours} 小時工時。`;
+                    }
+                    showAlert("成功", successMsg);
+                    if (onSuccess) onSuccess(newIssueId, gapHours);
+                } catch (e) {
+                    console.error("API Error:", e);
+                    let title = "API 連線失敗"; let msg = e.message;
+                    if (e.name === 'TypeError' && e.message === 'Failed to fetch') { 
+                        title = "連線被阻擋"; 
+                        msg = "無法連接到伺服器。\n\n";
+                        if (redmineApiConfig.corsProxy) {
+                            msg += "您已啟用 CORS 代理，但請求仍然失敗。\n可能原因：\n1. 代理伺服器不支援 POST 請求或自訂 Header。\n2. 代理伺服器網址錯誤或已失效。\n\n建議：更換代理服務 (如 corsproxy.io) 或下載本機執行。";
+                        } else {
+                            msg += "可能原因：\n1. 跨網域 (CORS) 限制。\n2. 混合內容 (HTTPS 呼叫 HTTP)。\n\n建議：\n- 在設定中啟用「CORS 代理」。\n- 下載至本機執行。";
+                        }
+                    }
+                    showAlert(title, msg);
+                } finally { setLoading(false); }
+            };
+
+            const hasStaticData = staticData.projects.length > 0 || staticData.trackers.length > 0;
 
             return (
                 <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 mb-6 shadow-sm text-sm">
@@ -1501,7 +1605,7 @@
                         <div className="animate-fade-in">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                                 <div className="space-y-3 p-3 bg-orange-100/50 rounded-lg border border-orange-100">
-                                    <div className="flex justify-between items-center"><label className="block font-bold text-orange-900 flex items-center gap-1"><Icon name="settings-2" size={14} /> Redmine 設定</label></div>
+                                    <div className="flex justify-between items-center"><label className="block font-bold text-orange-900 flex items-center gap-1"><Icon name="settings-2" size={14} /> Redmine 設定</label>{hasStaticData && <span className="text-xs text-green-600 bg-green-100 px-2 py-0.5 rounded">已載入設定資料</span>}</div>
                                     {(!redmineApiConfig.host || !redmineApiConfig.apiKey) && <div className="text-xs text-red-600 bg-red-50 p-2 rounded border border-red-200"><Icon name="alert-triangle" size={12} className="inline mr-1"/>請點擊右上角「設定」按鈕，填寫 Redmine 網址與 API Key。</div>}
                                     <SearchableSelect label="專案 (Project)" placeholder="輸入 ID 或搜尋..." value={redmineApiConfig.projectId} onChange={(val) => updateConfig('projectId', val)} options={staticData.projects} emptyText="無資料，請至設定匯入 API" />
                                     <div className="grid grid-cols-2 gap-2">
@@ -1516,6 +1620,10 @@
                                     <div><label className="text-xs text-gray-500 mb-0.5 block">完成百分比</label><select value={doneRatio} onChange={e=>updateField('doneRatio', e.target.value)} className="w-full border rounded px-2 py-1.5 focus:border-orange-500 outline-none bg-white">{[0,10,20,30,40,50,60,70,80,90,100].map(r => <option key={r} value={r}>{r}%</option>)}</select></div>
                                 </div>
                             </div>
+                            <div className="flex items-center justify-between pt-3 border-t border-orange-200">
+                                <label className="flex items-center gap-2 text-gray-700 cursor-pointer select-none font-medium"><input type="checkbox" checked={createLog} onChange={e=>setCreateLog(e.target.checked)} className="rounded text-orange-600 focus:ring-orange-500" /><span>同時回報工時 (Log Time)</span></label>
+                                <button onClick={handleCreate} disabled={loading} className="bg-orange-600 hover:bg-orange-700 text-white px-6 py-2.5 rounded-lg font-bold flex items-center gap-2 disabled:opacity-50 transition-colors shadow-sm">{loading ? <Icon name="loader-2" className="animate-spin" size={18} /> : <Icon name="send" size={18} />}{loading ? "處理中..." : "建立單據"}</button>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -1527,8 +1635,8 @@
             const [tasks, setTasks] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_tasks') || '[]').map(t => ({...t, isRunning: false})); } catch { return []; } });
             const [globalDate, setGlobalDate] = useState(() => localStorage.getItem('redmine_date') || new Date().toISOString().split('T')[0]);
             const [userName, setUserName] = useState(() => localStorage.getItem('redmine_user_v2') || '');
-            
-            // Default 3 pages for projects
+            const [redmineUserId, setRedmineUserId] = useState(null);
+            const [workSettings, setWorkSettings] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_work_settings') || '{"startTime":"09:00", "endTime":"18:00", "breakHours": 1, "enableDinnerBreak": true}'); } catch { return {startTime:"09:00", endTime:"18:00", breakHours: 1, enableDinnerBreak: true}; } });
             const [redmineApiConfig, setRedmineApiConfig] = useState(() => { 
                 try { 
                     const stored = JSON.parse(localStorage.getItem('redmine_api_config') || '{}');
@@ -1570,9 +1678,6 @@
             const [batchLoading, setBatchLoading] = useState(false);
             const commentInputRef = useRef(null);
             
-            // User ID State
-            const [redmineUserId, setRedmineUserId] = useState(null);
-
             // Sync State
             const [isServiceReady, setIsServiceReady] = useState(false);
             const [isInitialized, setIsInitialized] = useState(false);
@@ -1583,19 +1688,7 @@
             useEffect(() => { stateRef.current = { tasks, userName, globalDate, workSettings, staticData, redmineApiConfig }; }, [tasks, userName, globalDate, workSettings, staticData, redmineApiConfig]);
             
             // Work Settings Default
-            const [workSettings, setWorkSettings] = useState(() => { 
-                try { 
-                    const stored = JSON.parse(localStorage.getItem('redmine_work_settings') || '{}');
-                    return {
-                        startTime: stored.startTime || "09:00",
-                        endTime: stored.endTime || "18:00",
-                        breakHours: stored.breakHours !== undefined ? stored.breakHours : 1,
-                        enableDinnerBreak: stored.enableDinnerBreak !== undefined ? stored.enableDinnerBreak : true
-                    };
-                } catch { 
-                    return { startTime: "09:00", endTime: "18:00", breakHours: 1, enableDinnerBreak: true }; 
-                } 
-            });
+            // const [workSettings, setWorkSettings] = useState defined above
 
             // Persistence LocalStorage
             useEffect(() => localStorage.setItem('redmine_user_v2', userName), [userName]);
