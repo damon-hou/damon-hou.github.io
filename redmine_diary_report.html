@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Redmine 每日工時追蹤器 (自動同步修復版)</title>
+    <title>Redmine 每日工時追蹤器</title>
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -21,6 +21,7 @@
         @keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
         .modal-overlay { animation: fadeIn 0.2s ease-out forwards; }
         .modal-content { animation: scaleIn 0.2s ease-out forwards; }
+        .line-clamp-2 { overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
     </style>
 </head>
 <body>
@@ -139,9 +140,40 @@
 
     <!-- React App -->
     <script type="text/babel">
-        const { useState, useEffect, useRef, useCallback } = React;
+        const { useState, useEffect, useRef, useCallback, useLayoutEffect } = React;
 
         const FIXED_ACCESS_KEY = 'redmine_diary_report';
+
+        // --- Helper: Strip HTML & Clean Newlines ---
+        const stripHtml = (html) => {
+            if (!html) return "";
+            // Replace common block/break tags with newlines
+            let text = html.replace(/<br\s*\/?>/gi, '\n')
+                           .replace(/<\/p>/gi, '\n')
+                           .replace(/<\/li>/gi, '\n')
+                           .replace(/<\/div>/gi, '\n');
+            
+            // Create a temporary element to extract text
+            const temp = document.createElement("div");
+            temp.innerHTML = text;
+            text = temp.textContent || temp.innerText || "";
+            
+            // Collapse excessive newlines (max 2 consecutive newlines) and trim
+            return text.replace(/(\r\n|\n|\r){3,}/g, '\n\n').trim();
+        };
+
+        // --- Helper: Safe JSON Parse ---
+        const safeFetchJson = async (response) => {
+            const text = await response.text();
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                if (text.trim().toLowerCase().startsWith('<!doctype') || text.trim().toLowerCase().startsWith('<html')) {
+                    throw new Error("伺服器回傳了 HTML 頁面而非 JSON，請檢查 Redmine 網址、API Key 或 Proxy 設定。");
+                }
+                throw new Error(`JSON 解析失敗: ${text.substring(0, 50)}...`);
+            }
+        };
 
         // --- Icon Component ---
         const Icon = ({ name, size = 20, className = "" }) => {
@@ -183,7 +215,7 @@
         };
 
         // --- Settings Modal ---
-        const SettingsModal = ({ isOpen, onClose, options, setOptions, workSettings, setWorkSettings, staticData, setStaticData, redmineApiConfig, setRedmineApiConfig, userName, setUserName, syncStatus, lastSyncTime, onManualLoad, onManualSave, showAlert }) => {
+        const SettingsModal = ({ isOpen, onClose, options, setOptions, workSettings, setWorkSettings, staticData, setStaticData, redmineApiConfig, setRedmineApiConfig, userName, setUserName, setRedmineUserId, redmineUserId, syncStatus, lastSyncTime, onManualLoad, onManualSave, showAlert }) => {
             const [localWork, setLocalWork] = useState(workSettings);
             const [localApiConfig, setLocalApiConfig] = useState(redmineApiConfig);
             const [localUserName, setLocalUserName] = useState(userName);
@@ -212,26 +244,37 @@
             // Helper to prepare URL
             const prepareFetchUrl = (rawUrl) => {
                 let url = rawUrl.trim();
-                if (localApiConfig.apiKey) {
-                    url = url.replace(/\{密鑰\}/g, localApiConfig.apiKey).replace(/\{KEY\}/g, localApiConfig.apiKey);
+                let key = localApiConfig.apiKey ? localApiConfig.apiKey.trim() : '';
+
+                // 1. Replace placeholders (Robust Regex)
+                if (key) {
+                    url = url.replace(/\{(?:\s*key|api_?key|密鑰)\s*\}/gi, key);
                 }
                 
+                // 2. Handle Relative Paths and Host
                 if (url.startsWith('/')) {
                     if (localApiConfig.host) {
                         let host = localApiConfig.host.trim().replace(/\/$/, '');
                         if (!/^https?:\/\//i.test(host)) host = 'https://' + host;
                         url = host + url;
                     }
-                } 
-                else if (!/^https?:\/\//i.test(url)) {
+                } else if (!/^https?:\/\//i.test(url)) {
                     url = 'https://' + url;
                 }
 
+                // 3. Auto-append key if missing and key exists (Crucial for Proxy!)
+                if (key && !url.includes('key=') && !url.includes(key)) {
+                    const separator = url.includes('?') ? '&' : '?';
+                    url = `${url}${separator}key=${key}`;
+                }
+
+                // 4. Apply Proxy (Encode the WHOLE url including key)
                 if (localApiConfig.corsProxy) {
-                    if (localApiConfig.corsProxy.trim().endsWith('=')) {
-                        return localApiConfig.corsProxy + encodeURIComponent(url);
+                    let proxy = localApiConfig.corsProxy.trim();
+                    if (proxy.endsWith('=')) {
+                        return proxy + encodeURIComponent(url);
                     }
-                    return localApiConfig.corsProxy + url;
+                    return proxy + url;
                 }
                 return url;
             };
@@ -275,12 +318,21 @@
                 try {
                     for (let url of urls) {
                         const fetchUrl = prepareFetchUrl(url);
-                        const headers = localApiConfig.apiKey ? { 'X-Redmine-API-Key': localApiConfig.apiKey } : {};
+                        const headers = { 
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json'
+                        };
+                        if (!localApiConfig.corsProxy && localApiConfig.apiKey) {
+                             headers['X-Redmine-API-Key'] = localApiConfig.apiKey.trim();
+                        }
                         
+                        const maskedUrl = fetchUrl.replace(/key=([^&]+)/, 'key=***').replace(/key%3D([^&%]+)/, 'key%3D***');
+                        console.log(`[RedmineFetch] Fetching: ${maskedUrl}`);
+
                         const res = await fetch(fetchUrl, { headers });
-                        if (!res.ok) throw new Error(`Fetch failed: ${res.status} for ${url}`);
+                        if (!res.ok) throw new Error(`Fetch failed: ${res.status} for ${maskedUrl}`);
                         
-                        const data = await res.json();
+                        const data = await safeFetchJson(res);
                         
                         if (type === 'projects') {
                             if (data.projects) allResults = allResults.concat(data.projects);
@@ -298,11 +350,7 @@
                     return allResults.map(item => ({ id: item.id, name: item.name }));
                 } catch (e) {
                     if (!silent) {
-                        let msg = `${e.message}\n請檢查 URL、API Key 或 CORS 設定。`;
-                        if (e.name === 'TypeError' && e.message === 'Failed to fetch') {
-                            msg = "連線被瀏覽器阻擋 (CORS)。\n建議啟用「CORS 代理」或將檔案下載至本機執行。";
-                        }
-                        showAlert("載入失敗", msg);
+                        showAlert("載入失敗", `${e.message}\n\n請檢查網址、API Key 或 CORS 設定。`);
                     }
                     console.error(e);
                     return null;
@@ -326,22 +374,35 @@
                 if (results) setStaticData(prev => ({ ...prev, activities: results }));
             };
 
+            // Modified to return the name on success
             const handleFetchUser = async (silent = false) => {
                 if (!localApiConfig.host || !localApiConfig.apiKey) {
                     if (!silent) showAlert("錯誤", "請先設定 Redmine 網址與 API Key");
-                    return;
+                    return null;
                 }
                 
                 setIsFetching(prev => ({ ...prev, user: true }));
                 
                 try {
-                    const fetchUrl = prepareFetchUrl('/my/account.json');
-                    const headers = { 'X-Redmine-API-Key': localApiConfig.apiKey };
+                    const fetchUrl = prepareFetchUrl('/users/current.json');
+                    const headers = { 
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    };
+                    if (!localApiConfig.corsProxy && localApiConfig.apiKey) {
+                        headers['X-Redmine-API-Key'] = localApiConfig.apiKey.trim();
+                    }
+                    
+                    const maskedUrl = fetchUrl.replace(/key=([^&]+)/, 'key=***').replace(/key%3D([^&%]+)/, 'key%3D***');
+                    console.log(`[RedmineFetch] Fetching User: ${maskedUrl}`);
+
                     const res = await fetch(fetchUrl, { headers });
                     if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
                     
-                    const data = await res.json();
+                    const data = await safeFetchJson(res);
+
                     if (data.user) {
+                        setRedmineUserId(data.user.id);
                         const l = (data.user.lastname || '').trim();
                         const f = (data.user.firstname || '').trim();
                         let name = '';
@@ -358,24 +419,21 @@
 
                         setLocalUserName(name);
                         if (!silent) showAlert("成功", `已取得用戶名稱: ${name}`);
+                        return name; // Return name for handleSaveAndClose
                     } else {
                         throw new Error("API 回傳格式不如預期 (找不到 user 欄位)");
                     }
                 } catch (e) {
                     if (!silent) {
-                        let msg = `無法取得用戶資訊: ${e.message}`;
-                         if (e.name === 'TypeError' && e.message === 'Failed to fetch') {
-                            msg = "連線被瀏覽器阻擋 (CORS)。\n建議啟用「CORS 代理」。";
-                        }
-                        showAlert("失敗", msg);
+                        showAlert("失敗", `無法取得用戶資訊: ${e.message}`);
                     }
                     console.error(e);
                 } finally {
                     setIsFetching(prev => ({ ...prev, user: false }));
                 }
+                return null;
             };
 
-            // 新增：自動載入所有 Redmine 資料
             const handleAutoLoad = async () => {
                 if (!localApiConfig.host || !localApiConfig.apiKey) return;
                 
@@ -394,12 +452,11 @@
                 showAlert("自動載入完成", "已根據 API Key 自動更新用戶與下拉選單資料。");
             };
 
-            const getAndApplySettings = () => {
+            const getAndApplySettings = (overrideUserName = null) => {
                 let newProjects = staticData.projects;
                 let newTrackers = staticData.trackers;
                 let newActivities = staticData.activities;
                 
-                // Fallback: If user pasted JSON manually, try to parse it
                 if(projectsJson && projectsJson.trim().startsWith('{')) {
                     try { newProjects = parseRedmineJson(projectsJson, 'projects').map(p => ({ id: p.id, name: p.name })); } catch (e) { showAlert("設定錯誤", e.message); return null; }
                 }
@@ -418,19 +475,35 @@
 
                 setWorkSettings(localWork);
                 setRedmineApiConfig(localApiConfig);
-                setUserName(localUserName);
+                
+                // Apply the fetched username if provided, otherwise use local state
+                const finalUserName = overrideUserName !== null ? overrideUserName : localUserName;
+                setLocalUserName(finalUserName); // Ensure local state is also updated
+                setUserName(finalUserName); // Update parent state
+                
                 setStaticData(newStaticData);
 
                 return {
-                    userName: localUserName,
+                    userName: finalUserName,
                     workSettings: localWork,
                     redmineApiConfig: localApiConfig,
                     staticData: newStaticData
                 };
             };
 
-            const handleSaveAndClose = () => {
-                if (getAndApplySettings()) {
+            const handleSaveAndClose = async () => {
+                let fetchedName = null;
+                
+                // Attempt to fetch user info if API key is present
+                if (localApiConfig.apiKey && localApiConfig.host) {
+                    try {
+                        fetchedName = await handleFetchUser(true); // Silent fetch
+                    } catch (e) {
+                        console.error("Auto fetch user failed on save:", e);
+                    }
+                }
+                
+                if (getAndApplySettings(fetchedName)) {
                     onClose();
                 }
             };
@@ -569,23 +642,21 @@
                                         <input type="time" value={localWork.endTime} onChange={e => setLocalWork({...localWork, endTime: e.target.value})} className="w-full border rounded px-2 py-1.5 text-sm" />
                                     </div>
                                 </div>
-                                <div className="space-y-3">
-                                    <div>
-                                        <label className="text-xs text-gray-500 block mb-1">午休/休息扣除 (小時)</label>
-                                        <input type="number" step="0.5" value={localWork.breakHours} onChange={e => setLocalWork({...localWork, breakHours: parseFloat(e.target.value)})} className="w-full border rounded px-2 py-1.5 text-sm" />
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        <input 
-                                            type="checkbox" 
-                                            id="deductDinner"
-                                            checked={localWork.enableDinnerBreak !== false} 
-                                            onChange={e => setLocalWork({...localWork, enableDinnerBreak: e.target.checked})}
-                                            className="rounded text-blue-600 focus:ring-blue-500"
-                                        />
-                                        <label htmlFor="deductDinner" className="text-sm text-gray-700 cursor-pointer select-none">
-                                            自動扣除晚餐時間 (18:00 ~ 18:30)
-                                        </label>
-                                    </div>
+                                <div>
+                                    <label className="text-xs text-gray-500 block mb-1">午休/休息扣除 (小時)</label>
+                                    <input type="number" step="0.5" value={localWork.breakHours} onChange={e => setLocalWork({...localWork, breakHours: parseFloat(e.target.value)})} className="w-full border rounded px-2 py-1.5 text-sm" />
+                                </div>
+                                <div className="flex items-center gap-2 mt-2">
+                                    <input 
+                                        type="checkbox" 
+                                        id="deductDinner"
+                                        checked={localWork.enableDinnerBreak !== false} 
+                                        onChange={e => setLocalWork({...localWork, enableDinnerBreak: e.target.checked})}
+                                        className="rounded text-blue-600 focus:ring-blue-500"
+                                    />
+                                    <label htmlFor="deductDinner" className="text-sm text-gray-700 cursor-pointer select-none">
+                                        自動扣除晚餐時間 (18:00 ~ 18:30)
+                                    </label>
                                 </div>
                             </div>
                             
@@ -857,11 +928,21 @@
         const TaskTextarea = ({ value, onChange }) => {
             const textareaRef = useRef(null);
             
+            // 使用 useLayoutEffect 確保在繪製前更新高度，避免閃爍
+            // 並加入 setTimeout(0) 確保在 DOM 更新週期後強制重算
             useEffect(() => {
-                if (textareaRef.current) {
-                    textareaRef.current.style.height = 'auto';
-                    textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
-                }
+                const adjustHeight = () => {
+                    if (textareaRef.current) {
+                        textareaRef.current.style.height = 'auto'; // Reset height
+                        textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px'; // Set to content height
+                    }
+                };
+                
+                adjustHeight();
+                
+                // Fallback for batch updates or fast state changes
+                const timer = setTimeout(adjustHeight, 0);
+                return () => clearTimeout(timer);
             }, [value]);
 
             return (
@@ -876,31 +957,521 @@
             );
         };
 
+        // --- Daily Activity Panel ---
+        const DailyActivityPanel = ({ date, redmineApiConfig, redmineUserId, onAddTask, showAlert, staticData, localUserName, onBatchAdd }) => {
+            const [activities, setActivities] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [expandedIds, setExpandedIds] = useState(new Set());
+            const [isAllExpanded, setIsAllExpanded] = useState(false);
+            const [progress, setProgress] = useState(null); // { current, total, text }
+            const [selectedProjectIds, setSelectedProjectIds] = useState(new Set());
+            const [isProjectFilterOpen, setIsProjectFilterOpen] = useState(false);
+            const [projectFilterSearch, setProjectFilterSearch] = useState(""); // New state for search
+            const [selectedActivityIds, setSelectedActivityIds] = useState(new Set()); // For batch selection
+
+            const fetchWithRetry = async (url, options, retries = 3, backoff = 300) => {
+                for (let i = 0; i < retries; i++) {
+                    try {
+                        const res = await fetch(url, options);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        return res;
+                    } catch (err) {
+                        if (i === retries - 1) throw err;
+                        await new Promise(r => setTimeout(r, backoff * (i + 1)));
+                    }
+                }
+            };
+            
+            const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+            const fetchActivities = async () => {
+                if (!redmineApiConfig.host || !redmineApiConfig.apiKey) {
+                    showAlert("提示", "請先至「設定」設定 Redmine 連線資訊。");
+                    return;
+                }
+                
+                if (!redmineUserId) {
+                    showAlert("提示", "尚未取得用戶 ID。\n請至「設定」>「個人設定」點擊「從 Redmine 載入」，以獲取您的 User ID 用於篩選日記。");
+                    return;
+                }
+                
+                setLoading(true);
+                setProgress(null);
+                setActivities([]);
+                setSelectedActivityIds(new Set()); // Reset selection on new search
+                const baseUrl = redmineApiConfig.host.trim().replace(/\/$/, '');
+                const finalBaseUrl = /^https?:\/\//i.test(baseUrl) ? baseUrl : `https://${baseUrl}`;
+                
+                const getFetchUrl = (url) => {
+                    if (redmineApiConfig.corsProxy) {
+                         if (redmineApiConfig.corsProxy.trim().endsWith('=')) return redmineApiConfig.corsProxy + encodeURIComponent(url);
+                         return redmineApiConfig.corsProxy + url;
+                    }
+                    return url;
+                };
+
+                // Helper to add key if missing
+                const appendKey = (url) => {
+                     if (url.includes('key=')) return url;
+                     const separator = url.includes('?') ? '&' : '?';
+                     return `${url}${separator}key=${redmineApiConfig.apiKey}`;
+                };
+
+                try {
+                    let candidates = [];
+                    
+                    let targetProjects = [];
+                    if (selectedProjectIds.size > 0) {
+                        if (!staticData || !staticData.projects) {
+                             showAlert("錯誤", "專案列表未載入");
+                             setLoading(false);
+                             return;
+                        }
+                        targetProjects = staticData.projects.filter(p => selectedProjectIds.has(p.id));
+                        console.log(`[RedmineDebug] Selected Projects mode. Count: ${targetProjects.length}`);
+                    }
+
+                    if (targetProjects.length > 0) {
+                         setProgress({ current: 0, total: targetProjects.length, text: "正在掃描選定專案..." });
+                         let allIssues = [];
+                         const projectChunks = [];
+                         const pChunkSize = 5; 
+                         for (let i=0; i<targetProjects.length; i+=pChunkSize) {
+                             projectChunks.push(targetProjects.slice(i, i+pChunkSize));
+                         }
+
+                         let processed = 0;
+                         for (const chunk of projectChunks) {
+                             const promises = chunk.map(p => {
+                                 // Increased limit back to 100 for better coverage
+                                 const url = `${finalBaseUrl}/issues.json?project_id=${p.id}&updated_on=${date}&status_id=*&limit=100&nometa=1&key=${redmineApiConfig.apiKey}`;
+                                 console.log(`[RedmineDebug] Scanning Project: ${p.name} (ID: ${p.id}) URL: ${url.replace(/key=([^&]+)/, 'key=***')}`);
+                                 return fetchWithRetry(getFetchUrl(appendKey(url)), 
+                                     { headers: { 'X-Redmine-API-Key': redmineApiConfig.apiKey } }
+                                 ).then(r => safeFetchJson(r)).catch(()=>({issues:[]}));
+                             });
+                             
+                             const results = await Promise.all(promises);
+                             results.forEach(r => { if(r.issues) allIssues.push(...r.issues); });
+                             
+                             processed += chunk.length;
+                             setProgress(prev => ({ ...prev, current: processed }));
+                             await delay(100); 
+                         }
+                         candidates = allIssues;
+
+                    } else {
+                        try {
+                            const limit = 100; // Increased limit back to 100
+                            const commonParams = `&limit=${limit}&nometa=1&key=${redmineApiConfig.apiKey}`;
+                            
+                            const queries = [
+                                { url: `${finalBaseUrl}/issues.json?updated_on=${date}&status_id=*${commonParams}`, name: 'Global' },
+                                { url: `${finalBaseUrl}/issues.json?updated_on=${date}&assigned_to_id=me&status_id=*${commonParams}`, name: 'Assigned' },
+                                { url: `${finalBaseUrl}/issues.json?updated_on=${date}&author_id=me&status_id=*${commonParams}`, name: 'Author' },
+                                { url: `${finalBaseUrl}/issues.json?updated_on=${date}&watcher_id=me&status_id=*${commonParams}`, name: 'Watcher' },
+                                { url: `${finalBaseUrl}/issues.json?updated_on=${date}&updated_by=me&status_id=*${commonParams}`, name: 'UpdatedBy' } 
+                            ];
+
+                            console.log(`[RedmineDebug] Attempting Global Search with URLs (Limit ${limit}):`, queries.map(q => q.url.replace(/key=([^&]+)/, 'key=***')));
+
+                            const queryResults = await Promise.allSettled(queries.map(q => 
+                                fetch(getFetchUrl(appendKey(q.url)), { headers: { 'X-Redmine-API-Key': redmineApiConfig.apiKey } })
+                                    .then(async res => {
+                                        if (res.status === 403) throw new Error("403");
+                                        if (!res.ok) throw new Error(`List fetch failed`);
+                                        return safeFetchJson(res);
+                                    })
+                            ));
+                            
+                            let globalForbidden = false;
+
+                            queryResults.forEach((res, index) => {
+                                if (res.status === 'fulfilled' && res.value.issues) {
+                                    candidates.push(...res.value.issues);
+                                } else if (res.status === 'rejected' && res.reason.message === "403") {
+                                    if (index === 0) globalForbidden = true; 
+                                }
+                            });
+
+                            if (globalForbidden) {
+                                 console.warn("[RedmineDebug] Global fetch forbidden (403), executing per-project scan...");
+                                 
+                                 if (!staticData || !staticData.projects || staticData.projects.length === 0) {
+                                     showAlert("權限受限", "全域搜尋被拒 (403)，且無專案列表可供掃描。\n請先至「設定」點擊「測試並儲存專案清單」，以便進行逐專案搜尋。");
+                                     setLoading(false);
+                                     return;
+                                 }
+
+                                 let allIssues = [];
+                                 const projectChunks = [];
+                                 const pChunkSize = 5; 
+                                 for (let i=0; i<staticData.projects.length; i+=pChunkSize) {
+                                     projectChunks.push(staticData.projects.slice(i, i+pChunkSize));
+                                 }
+
+                                 let processedProjects = 0;
+                                 setProgress({ current: 0, total: staticData.projects.length, text: "正在掃描專案..." });
+
+                                 for (const chunk of projectChunks) {
+                                     const promises = chunk.map(p => {
+                                         // Also reduce limit here and add nometa
+                                         const url = `${finalBaseUrl}/issues.json?project_id=${p.id}&updated_on=${date}&status_id=*&limit=50&nometa=1&key=${redmineApiConfig.apiKey}`;
+                                         console.log(`[RedmineDebug] Scanning Project: ${p.name} URL: ${url.replace(/key=([^&]+)/, 'key=***')}`);
+                                         return fetchWithRetry(getFetchUrl(appendKey(url)), 
+                                             { headers: { 'X-Redmine-API-Key': redmineApiConfig.apiKey } }
+                                         ).then(r => safeFetchJson(r)).catch(()=>({issues:[]}));
+                                     });
+                                     const results = await Promise.all(promises);
+                                     results.forEach(r => { if(r.issues) allIssues.push(...r.issues); });
+                                     
+                                     processedProjects += chunk.length;
+                                     setProgress(prev => ({ ...prev, current: processedProjects }));
+                                     await delay(200); 
+                                 }
+                                 candidates.push(...allIssues);
+                            }
+                        } catch (e) {
+                             throw e;
+                        }
+                    }
+
+                    // Deduplicate
+                    const seen = new Set();
+                    candidates = candidates.filter(item => {
+                        if (seen.has(item.id)) return false;
+                        seen.add(item.id);
+                        return true;
+                    });
+                    
+                    console.log(`[RedmineDebug] Total Candidates Found: ${candidates.length}`, candidates);
+
+                    const results = [];
+                    const chunks = [];
+                    const chunkSize = 5;
+                    for (let i = 0; i < candidates.length; i += chunkSize) {
+                        chunks.push(candidates.slice(i, i + chunkSize));
+                    }
+
+                    let processedIssues = 0;
+                    setProgress({ current: 0, total: candidates.length, text: "正在讀取筆記..." });
+
+                    for (const chunk of chunks) {
+                        const promises = chunk.map(async (issue) => {
+                            try {
+                                console.log(`[RedmineDebug] Checking Issue #${issue.id}`);
+                                const detailUrl = getFetchUrl(appendKey(`${finalBaseUrl}/issues/${issue.id}.json?include=journals&key=${redmineApiConfig.apiKey}`));
+                                const detailRes = await fetchWithRetry(detailUrl, { headers: { 'X-Redmine-API-Key': redmineApiConfig.apiKey } });
+                                if (!detailRes.ok) return null;
+                                const detailData = await safeFetchJson(detailRes);
+                                const fullIssue = detailData.issue;
+
+                                const userJournals = (fullIssue.journals || []).filter(j => {
+                                    // Check user match
+                                    const userMatch = j.user.id === redmineUserId;
+                                    
+                                    // Robust date comparison
+                                    const journalDate = new Date(j.created_on);
+                                    const localJournalDate = journalDate.getFullYear() + '-' + 
+                                        String(journalDate.getMonth() + 1).padStart(2, '0') + '-' + 
+                                        String(journalDate.getDate()).padStart(2, '0');
+                                        
+                                    const dateMatch = localJournalDate === date;
+                                    const hasContent = (j.notes && j.notes.trim().length > 0) || (j.details && j.details.length > 0);
+
+                                    if (!dateMatch) console.log(`[RedmineDebug] Journal Skipped: Date ${localJournalDate} !== ${date}`);
+                                    
+                                    return userMatch && dateMatch && hasContent;
+                                });
+
+                                if (userJournals.length > 0) {
+                                    console.log(`[RedmineDebug] Match Found: Issue #${fullIssue.id}`);
+                                    return {
+                                        id: fullIssue.id,
+                                        project: fullIssue.project.name,
+                                        subject: fullIssue.subject,
+                                        notes: userJournals.map(j => {
+                                            const time = new Date(j.created_on).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                                            let content = "";
+                                            if (j.notes) content += stripHtml(j.notes);
+                                            if (j.details && j.details.length > 0) {
+                                                const detailsText = j.details.map(d => `[系統] ${d.name}: ${d.old_value || '(無)'} -> ${d.new_value}`).join('\n');
+                                                content += (content ? '\n' : '') + detailsText;
+                                            }
+                                            return `[${time}] ${content}`;
+                                        }).join('\n\n---\n\n')
+                                    };
+                                }
+                                return null;
+                            } catch (e) {
+                                console.warn(`Error fetching issue ${issue.id}, skipping.`);
+                                return null;
+                            }
+                        });
+                        
+                        const chunkResults = await Promise.all(promises);
+                        results.push(...chunkResults.filter(r => r !== null));
+                        
+                        processedIssues += chunk.length;
+                        setProgress(prev => ({ ...prev, current: processedIssues }));
+                        await delay(200); // Throttling
+                    }
+                    
+                    console.log(`[RedmineDebug] Final Results: ${results.length}`, results);
+                    setActivities(results);
+                    if (results.length === 0) showAlert("提示", "該日期沒有找到您參與並留言的議題。");
+
+                } catch (e) {
+                    console.error(e);
+                    showAlert("查詢失敗", e.message);
+                } finally {
+                    setLoading(false);
+                    setProgress(null);
+                }
+            };
+
+            const toggleExpand = (id) => {
+                const newSet = new Set(expandedIds);
+                if (newSet.has(id)) newSet.delete(id);
+                else newSet.add(id);
+                setExpandedIds(newSet);
+            };
+
+            const toggleAll = () => {
+                if (isAllExpanded) {
+                    setExpandedIds(new Set());
+                } else {
+                    setExpandedIds(new Set(activities.map(a => a.id)));
+                }
+                setIsAllExpanded(!isAllExpanded);
+            };
+            
+            const handleProjectToggle = (pid) => {
+                const newSet = new Set(selectedProjectIds);
+                if (newSet.has(pid)) newSet.delete(pid);
+                else newSet.add(pid);
+                setSelectedProjectIds(newSet);
+            };
+            
+            // --- Batch Operations ---
+            const toggleSelectActivity = (id) => {
+                const newSet = new Set(selectedActivityIds);
+                if (newSet.has(id)) newSet.delete(id);
+                else newSet.add(id);
+                setSelectedActivityIds(newSet);
+            };
+
+            const toggleSelectAllActivities = () => {
+                if (selectedActivityIds.size === activities.length) {
+                    setSelectedActivityIds(new Set());
+                } else {
+                    setSelectedActivityIds(new Set(activities.map(a => a.id)));
+                }
+            };
+
+            const handleBatchAdd = () => {
+                const itemsToAdd = activities.filter(a => selectedActivityIds.has(a.id)).map(a => ({
+                    issueId: a.id,
+                    comment: a.notes,
+                    projectName: a.project
+                }));
+                onBatchAdd(itemsToAdd);
+                setSelectedActivityIds(new Set());
+            };
+            
+            const filteredProjects = staticData && staticData.projects ? staticData.projects.filter(p => p.name.toLowerCase().includes(projectFilterSearch.toLowerCase())) : [];
+
+            return (
+                <div className="bg-white p-4 rounded-xl shadow-sm mb-6 border border-gray-100">
+                    <div className="flex justify-between items-start mb-3 gap-2">
+                        <div className="flex flex-col gap-2 flex-grow">
+                             <div className="flex items-center gap-2">
+                                <h3 className="font-bold text-gray-700 flex items-center gap-2">
+                                    <Icon name="history" size={18} /> Redmine 當日足跡
+                                </h3>
+                                <button 
+                                    onClick={fetchActivities} 
+                                    disabled={loading || !redmineUserId}
+                                    className="text-xs bg-indigo-50 text-indigo-600 px-2 py-1 rounded hover:bg-indigo-100 transition-colors flex items-center gap-1"
+                                >
+                                    {loading ? <Icon name="loader-2" className="animate-spin" size={12} /> : <Icon name="search" size={12} />}
+                                    {loading ? '搜尋中...' : '搜尋'}
+                                </button>
+                                
+                                <div className="relative">
+                                    <button 
+                                        onClick={() => setIsProjectFilterOpen(!isProjectFilterOpen)}
+                                        className={`text-xs px-2 py-1 rounded border flex items-center gap-1 transition-colors ${selectedProjectIds.size > 0 ? 'bg-orange-50 border-orange-200 text-orange-600' : 'bg-white border-gray-200 text-gray-500 hover:bg-gray-50'}`}
+                                    >
+                                        <Icon name="filter" size={12} />
+                                        {selectedProjectIds.size > 0 ? `已選 ${selectedProjectIds.size} 專案` : '篩選專案'}
+                                    </button>
+                                    
+                                    {isProjectFilterOpen && (
+                                        <div className="absolute top-full left-0 mt-1 w-64 bg-white border border-gray-200 rounded-lg shadow-xl z-50 max-h-60 overflow-y-auto p-2 flex flex-col">
+                                            <div className="mb-2">
+                                                <input 
+                                                    type="text" 
+                                                    placeholder="搜尋專案..." 
+                                                    value={projectFilterSearch}
+                                                    onChange={(e) => setProjectFilterSearch(e.target.value)}
+                                                    className="w-full border rounded px-2 py-1 text-xs outline-none focus:border-indigo-500"
+                                                    autoFocus
+                                                />
+                                            </div>
+                                            <div className="flex-grow overflow-y-auto space-y-1">
+                                                <div 
+                                                    onClick={() => setSelectedProjectIds(new Set())}
+                                                    className={`px-2 py-1.5 rounded cursor-pointer text-xs ${selectedProjectIds.size === 0 ? 'bg-indigo-50 text-indigo-600 font-bold' : 'hover:bg-gray-50 text-gray-700'}`}
+                                                >
+                                                    全部 (自動判斷)
+                                                </div>
+                                                {filteredProjects.length > 0 ? filteredProjects.map(p => (
+                                                    <label key={p.id} className="flex items-center gap-2 px-2 py-1 hover:bg-gray-50 rounded cursor-pointer">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            checked={selectedProjectIds.has(p.id)}
+                                                            onChange={() => handleProjectToggle(p.id)}
+                                                            className="rounded text-indigo-600 focus:ring-indigo-500 w-3 h-3"
+                                                        />
+                                                        <span className="text-xs text-gray-700 truncate" title={p.name}>{p.name}</span>
+                                                    </label>
+                                                )) : <div className="text-xs text-gray-400 p-2 text-center">無符合專案</div>}
+                                            </div>
+                                            <div className="pt-2 border-t mt-2 flex justify-end">
+                                                <button onClick={() => setIsProjectFilterOpen(false)} className="text-xs bg-gray-800 text-white px-2 py-1 rounded">確定</button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                                {selectedActivityIds.size > 0 && (
+                                    <button 
+                                        onClick={handleBatchAdd}
+                                        className="text-xs bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 transition-colors flex items-center gap-1 shadow-sm font-bold ml-2"
+                                    >
+                                        <Icon name="plus-circle" size={14} />
+                                        批次加入 ({selectedActivityIds.size})
+                                    </button>
+                                )}
+                            </div>
+                            
+                            {/* Selected Projects Tags */}
+                            {selectedProjectIds.size > 0 && (
+                                <div className="flex flex-wrap gap-2 items-center bg-gray-50 p-2 rounded-lg border border-gray-100 w-full mt-2">
+                                    <span className="text-xs text-gray-400 font-bold">已鎖定:</span>
+                                    {staticData.projects
+                                        .filter(p => selectedProjectIds.has(p.id))
+                                        .map(p => (
+                                            <span key={p.id} className="inline-flex items-center gap-1 px-2 py-1 rounded bg-white border border-gray-200 text-xs text-gray-600 shadow-sm">
+                                                {p.name}
+                                                <button 
+                                                    onClick={() => handleProjectToggle(p.id)}
+                                                    className="text-gray-400 hover:text-red-500 transition-colors"
+                                                >
+                                                    <Icon name="x" size={12} />
+                                                </button>
+                                            </span>
+                                        ))
+                                    }
+                                    <button 
+                                        onClick={() => setSelectedProjectIds(new Set())}
+                                        className="text-xs text-red-400 hover:text-red-600 underline ml-auto"
+                                    >
+                                        清除全部
+                                    </button>
+                                </div>
+                            )}
+
+                             {/* User Info Display */}
+                            {redmineUserId && (
+                                <div className="text-[10px] text-gray-400 flex items-center gap-1 ml-1">
+                                    <Icon name="user-check" size={10} />
+                                    <span>當前篩選用戶: {localUserName} (ID: {redmineUserId})</span>
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex flex-col items-end gap-2">
+                            {activities.length > 0 && (
+                                <div className="flex items-center gap-2">
+                                    <label className="flex items-center gap-1 text-xs text-gray-500 cursor-pointer select-none">
+                                        <input 
+                                            type="checkbox" 
+                                            checked={activities.length > 0 && selectedActivityIds.size === activities.length}
+                                            onChange={toggleSelectAllActivities}
+                                            className="rounded text-indigo-600 focus:ring-indigo-500"
+                                        />
+                                        全選
+                                    </label>
+                                    <button onClick={toggleAll} className="text-xs text-gray-400 hover:text-gray-600">
+                                        {isAllExpanded ? '全部收合' : '全部展開'}
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    
+                    {progress && (
+                        <div className="mb-3 text-xs text-blue-600 bg-blue-50 px-2 py-1 rounded flex items-center gap-2">
+                            <Icon name="loader-2" className="animate-spin" size={12} />
+                            <span>{progress.text} ({progress.current}/{progress.total})</span>
+                        </div>
+                    )}
+
+                    {activities.length > 0 ? (
+                        <div className="space-y-3">
+                            {activities.map(act => (
+                                <div key={act.id} className={`border rounded-lg p-3 transition-colors ${selectedActivityIds.has(act.id) ? 'border-green-300 bg-green-50/30' : 'border-gray-100 hover:border-gray-300'}`}>
+                                    <div className="flex justify-between items-start gap-2">
+                                        <div className="flex items-start gap-3 flex-grow min-w-0">
+                                            <input 
+                                                type="checkbox" 
+                                                checked={selectedActivityIds.has(act.id)}
+                                                onChange={() => toggleSelectActivity(act.id)}
+                                                className="mt-1 rounded text-indigo-600 focus:ring-indigo-500"
+                                            />
+                                            <div className="flex-grow min-w-0" onClick={() => toggleExpand(act.id)}>
+                                                <div className="flex items-center gap-2 text-xs text-gray-500 mb-1">
+                                                    <span className="bg-gray-100 px-1.5 py-0.5 rounded text-gray-600">{act.project}</span>
+                                                    <span className="font-mono">#{act.id}</span>
+                                                </div>
+                                                <div className="font-medium text-gray-800 text-sm truncate">{act.subject}</div>
+                                                
+                                                <div className={`text-xs text-gray-500 mt-2 bg-gray-50 p-2 rounded cursor-pointer whitespace-pre-wrap font-mono ${expandedIds.has(act.id) ? '' : 'line-clamp-2'}`}>
+                                                    {act.notes}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <button 
+                                            onClick={() => onAddTask({
+                                                issueId: act.id,
+                                                comment: act.notes, 
+                                                projectName: act.project
+                                            })}
+                                            className="flex-shrink-0 p-2 bg-green-50 text-green-600 rounded hover:bg-green-100 transition-colors"
+                                            title="加入任務列表"
+                                        >
+                                            <Icon name="plus" size={18} />
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    ) : (
+                         !loading && <div className="text-center text-xs text-gray-400 py-4">點擊搜尋以載入當日 Redmine 活動紀錄</div>
+                    )}
+                </div>
+            );
+        };
+
         // --- Redmine Gap Filler Component ---
         const RedmineGapFiller = ({ gapHours, date, onSuccess, showAlert, staticData, redmineApiConfig, setRedmineApiConfig, state, setState }) => {
-            // Using lifted state from App
             const { subject, description, doneRatio, enabled } = state;
-            const [loading, setLoading] = useState(false);
-            const [createLog, setCreateLog] = useState(true);
-
-            // Update local state helpers (that update parent state)
+            
             const updateField = (field, value) => {
                 setState(prev => ({ ...prev, [field]: value }));
             };
 
             const updateConfig = (key, val) => setRedmineApiConfig(prev => ({ ...prev, [key]: val }));
-
-            // Helper to get fetch URL (apply proxy if needed)
-            const getFetchUrl = (url, config) => {
-                let target = url;
-                if (config.corsProxy) {
-                    if (config.corsProxy.trim().endsWith('=')) {
-                        return config.corsProxy + encodeURIComponent(target);
-                    }
-                    return config.corsProxy + target;
-                }
-                return target;
-            };
 
             return (
                 <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 mb-6 shadow-sm text-sm">
@@ -946,20 +1517,35 @@
             );
         };
 
-        // --- Main App ---
+        // --- App Component ---
         const App = () => {
             const [tasks, setTasks] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_tasks') || '[]').map(t => ({...t, isRunning: false})); } catch { return []; } });
             const [globalDate, setGlobalDate] = useState(() => localStorage.getItem('redmine_date') || new Date().toISOString().split('T')[0]);
             const [userName, setUserName] = useState(() => localStorage.getItem('redmine_user_v2') || '');
-            const [workSettings, setWorkSettings] = useState(() => { try { return JSON.parse(localStorage.getItem('redmine_work_settings') || '{"startTime":"09:00", "endTime":"18:00", "breakHours": 1, "enableDinnerBreak": true}'); } catch { return {startTime:"09:00", endTime:"18:00", breakHours: 1, enableDinnerBreak: true}; } });
+            
+            // Default 3 pages for projects
             const [redmineApiConfig, setRedmineApiConfig] = useState(() => { 
                 try { 
                     const stored = JSON.parse(localStorage.getItem('redmine_api_config') || '{}');
-                    return { ...stored, host: stored.host || 'https://igs.redmine-x.com', corsProxy: stored.corsProxy || 'https://corsproxy.io/?url=', projectsApiUrl: stored.projectsApiUrl || '/projects.json?key={密鑰}&limit=100&offset=0\n/projects.json?key={密鑰}&limit=100&offset=100', trackersApiUrl: stored.trackersApiUrl || '/projects/old_web.json?include=trackers&key={密鑰}', activitiesApiUrl: stored.activitiesApiUrl || '/enumerations/time_entry_activities.json?key={密鑰}' };
+                    return { 
+                        ...stored, 
+                        host: stored.host || 'https://igs.redmine-x.com', 
+                        corsProxy: stored.corsProxy || 'https://corsproxy.io/?url=', 
+                        projectsApiUrl: stored.projectsApiUrl || '/projects.json?key={密鑰}&limit=100&offset=0\n/projects.json?key={密鑰}&limit=100&offset=100\n/projects.json?key={密鑰}&limit=100&offset=200', 
+                        trackersApiUrl: stored.trackersApiUrl || '/projects/old_web.json?include=trackers&key={密鑰}', 
+                        activitiesApiUrl: stored.activitiesApiUrl || '/enumerations/time_entry_activities.json?key={密鑰}' 
+                    };
                 } catch { 
-                    return { host: 'https://igs.redmine-x.com', corsProxy: 'https://corsproxy.io/?url=', projectsApiUrl: '/projects.json?key={密鑰}&limit=100&offset=0\n/projects.json?key={密鑰}&limit=100&offset=100', trackersApiUrl: '/projects/old_web.json?include=trackers&key={密鑰}', activitiesApiUrl: '/enumerations/time_entry_activities.json?key={密鑰}' }; 
+                    return { 
+                        host: 'https://igs.redmine-x.com', 
+                        corsProxy: 'https://corsproxy.io/?url=', 
+                        projectsApiUrl: '/projects.json?key={密鑰}&limit=100&offset=0\n/projects.json?key={密鑰}&limit=100&offset=100\n/projects.json?key={密鑰}&limit=100&offset=200', 
+                        trackersApiUrl: '/projects/old_web.json?include=trackers&key={密鑰}', 
+                        activitiesApiUrl: '/enumerations/time_entry_activities.json?key={密鑰}' 
+                    }; 
                 } 
             });
+
             const [staticData, setStaticData] = useState(() => { try { const stored = JSON.parse(localStorage.getItem('redmine_static_data') || '{}'); return { projects: stored.projects || [], trackers: stored.trackers || [], activities: stored.activities || [] }; } catch { return { projects: [], trackers: [], activities: [] }; } });
 
             // Gap Filler Lifted State
@@ -979,17 +1565,32 @@
             const [batchLoading, setBatchLoading] = useState(false);
             const commentInputRef = useRef(null);
             
+            // User ID State
+            const [redmineUserId, setRedmineUserId] = useState(null);
+
             // Sync State
             const [isServiceReady, setIsServiceReady] = useState(false);
             const [isInitialized, setIsInitialized] = useState(false);
             const [syncStatus, setSyncStatus] = useState('idle');
             const [lastSyncTime, setLastSyncTime] = useState(null);
             
-            // Ref to hold latest state for sync function
             const stateRef = useRef({ tasks, userName, globalDate, workSettings, staticData, redmineApiConfig });
-            useEffect(() => {
-                stateRef.current = { tasks, userName, globalDate, workSettings, staticData, redmineApiConfig };
-            }, [tasks, userName, globalDate, workSettings, staticData, redmineApiConfig]);
+            useEffect(() => { stateRef.current = { tasks, userName, globalDate, workSettings, staticData, redmineApiConfig }; }, [tasks, userName, globalDate, workSettings, staticData, redmineApiConfig]);
+            
+            // Work Settings Default
+            const [workSettings, setWorkSettings] = useState(() => { 
+                try { 
+                    const stored = JSON.parse(localStorage.getItem('redmine_work_settings') || '{}');
+                    return {
+                        startTime: stored.startTime || "09:00",
+                        endTime: stored.endTime || "18:00",
+                        breakHours: stored.breakHours !== undefined ? stored.breakHours : 1,
+                        enableDinnerBreak: stored.enableDinnerBreak !== undefined ? stored.enableDinnerBreak : true
+                    };
+                } catch { 
+                    return { startTime: "09:00", endTime: "18:00", breakHours: 1, enableDinnerBreak: true }; 
+                } 
+            });
 
             // Persistence LocalStorage
             useEffect(() => localStorage.setItem('redmine_user_v2', userName), [userName]);
@@ -998,6 +1599,15 @@
             useEffect(() => localStorage.setItem('redmine_static_data', JSON.stringify(staticData)), [staticData]); 
             useEffect(() => localStorage.setItem('redmine_api_config', JSON.stringify(redmineApiConfig)), [redmineApiConfig]);
             
+            // Persist Redmine User ID
+            useEffect(() => {
+                const storedId = localStorage.getItem('redmine_user_id');
+                if (storedId) setRedmineUserId(parseInt(storedId));
+            }, []);
+            useEffect(() => {
+                if (redmineUserId) localStorage.setItem('redmine_user_id', redmineUserId);
+            }, [redmineUserId]);
+
             useEffect(() => {
                 if (staticData.activities.length > 0) {
                     const activityNames = staticData.activities.map(a => a.name);
@@ -1010,55 +1620,28 @@
                 return () => clearInterval(interval);
             }, []);
 
-            // Wait for Service Ready
             useEffect(() => {
-                const checkService = () => {
-                    if (window.CloudService) {
-                        setIsServiceReady(true);
-                        return true;
-                    }
-                    return false;
-                };
-                if (!checkService()) {
-                    const interval = setInterval(() => {
-                        if (checkService()) clearInterval(interval);
-                    }, 200);
-                    return () => clearInterval(interval);
-                }
+                const checkService = () => { if (window.CloudService) { setIsServiceReady(true); return true; } return false; };
+                if (!checkService()) { const i = setInterval(() => { if (checkService()) clearInterval(i); }, 200); return () => clearInterval(i); }
             }, []);
 
-            // --- Unified Cloud Sync Function ---
             const saveToCloud = useCallback(async (dataOverride = null) => {
                 if (!window.CloudService) return;
                 setSyncStatus('saving');
                 try {
                     const currentState = stateRef.current;
-                    const dataToSave = dataOverride || { 
-                        userName: currentState.userName, 
-                        tasks: currentState.tasks.map(t => ({...t, isRunning: false})), 
-                        globalDate: currentState.globalDate, 
-                        workSettings: currentState.workSettings, 
-                        staticData: currentState.staticData, 
-                        redmineApiConfig: currentState.redmineApiConfig 
-                    }; 
+                    const dataToSave = dataOverride || { userName: currentState.userName, tasks: currentState.tasks.map(t => ({...t, isRunning: false})), globalDate: currentState.globalDate, workSettings: currentState.workSettings, staticData: currentState.staticData, redmineApiConfig: currentState.redmineApiConfig }; 
                     await window.CloudService.saveData(FIXED_ACCESS_KEY, dataToSave);
                     setSyncStatus('saved');
                     setLastSyncTime(new Date());
                 } catch (e) { 
-                    if (e.message.includes('OFFLINE_MODE')) {
-                         console.log("Auto Sync: Running in offline mode."); // Changed from error to log
-                         setSyncStatus('offline');
-                    } else {
-                         console.error("Auto Sync Error:", e);
-                         setSyncStatus('error');
-                    }
+                    if (e.message.includes('OFFLINE_MODE')) { console.log("Offline mode"); setSyncStatus('offline'); }
+                    else { console.error("Auto Sync Error:", e); setSyncStatus('error'); }
                 }
             }, []);
 
-            // --- Initial Auto-Load from Cloud ---
             useEffect(() => {
                 if (!isServiceReady) return;
-
                 const init = async () => {
                     try {
                         const data = await window.CloudService.loadData(FIXED_ACCESS_KEY);
@@ -1069,41 +1652,122 @@
                             if (data.workSettings) setWorkSettings(data.workSettings);
                             if (data.staticData) setStaticData(data.staticData);
                             if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
-                            
                             setLastSyncTime(new Date(data.updatedAt || Date.now()));
                             setSyncStatus('saved');
                         }
-                    } catch (e) {
-                         if (e.message.includes('OFFLINE_MODE')) {
-                             setSyncStatus('offline');
-                         }
-                    } finally {
-                        setIsInitialized(true);
-                    }
+                    } catch (e) { if (e.message.includes('OFFLINE_MODE')) setSyncStatus('offline'); } finally { setIsInitialized(true); }
                 };
                 init();
             }, [isServiceReady]);
 
-            // --- Effect 1: Auto-Save for SETTINGS changes (Fast debounce 500ms) ---
-            useEffect(() => {
-                if (!isInitialized) return; 
-                const timer = setTimeout(() => {
-                    saveToCloud();
-                }, 500);
-                return () => clearTimeout(timer);
-            }, [userName, workSettings, staticData, redmineApiConfig, saveToCloud, isInitialized]);
+            useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 500); return () => clearTimeout(timer); }, [userName, workSettings, staticData, redmineApiConfig, saveToCloud, isInitialized]);
+            useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 5000); return () => clearTimeout(timer); }, [tasks, saveToCloud, isInitialized]);
 
-            // --- Effect 2: Auto-Save for TASKS changes (Slow debounce 5000ms) ---
-            useEffect(() => {
-                if (!isInitialized) return;
-                const timer = setTimeout(() => {
-                    saveToCloud();
-                }, 5000);
-                return () => clearTimeout(timer);
-            }, [tasks, saveToCloud, isInitialized]);
+            const handleManualLoad = () => {
+                showConfirm("確認還原", "這將會使用雲端上的資料覆蓋您目前的設定與任務，確定執行嗎？", async () => {
+                    try {
+                        const data = await window.CloudService.loadData(FIXED_ACCESS_KEY);
+                        if (data.userName) setUserName(data.userName);
+                        if (data.tasks) setTasks(data.tasks);
+                        if (data.globalDate) setGlobalDate(data.globalDate);
+                        if (data.workSettings) setWorkSettings(data.workSettings);
+                        if (data.staticData) setStaticData(data.staticData);
+                        if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
+                        setLastSyncTime(new Date(data.updatedAt || Date.now()));
+                        showAlert("還原成功", "資料已同步至最新狀態！");
+                    } catch (e) { const msg = e.message.includes('OFFLINE_MODE') ? "目前無法連線至雲端 (離線模式)" : e.message; showAlert("還原失敗", msg); }
+                });
+            };
+
+            const showConfirm = (title, message, onConfirm) => setModalConfig({ isOpen: true, type: 'confirm', title, message, onConfirm });
+            const showAlert = (title, message) => setModalConfig({ isOpen: true, type: 'alert', title, message });
+            const closeModal = () => setModalConfig(p => ({...p, isOpen: false}));
 
             const getDecimalHours = (ms) => { const h = ms / 3600000; return roundTo === 0 ? h.toFixed(2) : (Math.ceil(h / roundTo) * roundTo).toFixed(2); };
 
+            // --- Updated Add Task with Duplicate Check ---
+            const addTask = (e) => { 
+                e.preventDefault(); 
+                if (!newTask.issueId) return; 
+
+                const duplicates = tasks.filter(t => String(t.issueId) === String(newTask.issueId));
+                const isDuplicate = duplicates.length > 0;
+                
+                const processAdd = () => {
+                    setTasks([...tasks, { id: Date.now(), ...newTask, duration: 0, isRunning: false }]); 
+                    setNewTask({ ...newTask, issueId: '', comment: '' }); 
+                };
+
+                if (isDuplicate) {
+                    let msg = `Issue #${newTask.issueId} 已存在於列表中：\n`;
+                    duplicates.forEach(d => {
+                        const h = getDecimalHours(d.duration);
+                        msg += `- 工時: ${h} hr`;
+                        if (d.comment === newTask.comment) {
+                            msg += ` (任務說明完全重複!)`;
+                        }
+                        msg += `\n`;
+                    });
+                    msg += `\n重複新增可能造成重複報工，確定要繼續嗎？`;
+                    
+                    showConfirm("重複提示", msg, processAdd);
+                } else {
+                    processAdd();
+                }
+            };
+            
+            // --- Updated Batch Add with Duplicate Check ---
+            const handleBatchAddTasks = (items) => {
+                const defaultActivity = staticData.activities[0]?.name || 'Development';
+                
+                // Identify duplicates with details
+                const duplicateDetails = [];
+                items.forEach(item => {
+                    const existingTasks = tasks.filter(t => String(t.issueId) === String(item.issueId));
+                    if (existingTasks.length > 0) {
+                        existingTasks.forEach(et => {
+                            let detail = `Issue #${item.issueId} (已填工時: ${getDecimalHours(et.duration)} hr)`;
+                            if (et.comment === item.comment) {
+                                detail += ` [說明重複]`;
+                            }
+                            duplicateDetails.push(detail);
+                        });
+                    }
+                });
+                
+                const processBatch = () => {
+                    const newEntries = items.map((item, index) => ({
+                        id: Date.now() + index + Math.random(), 
+                        issueId: item.issueId,
+                        projectName: item.projectName || '',
+                        comment: item.comment || '',
+                        activityId: defaultActivity,
+                        duration: 0,
+                        isRunning: false,
+                        uploaded: false
+                    }));
+                    setTasks(prev => [...prev, ...newEntries]);
+                    showAlert("成功", `已加入 ${newEntries.length} 筆任務至列表`);
+                    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); 
+                };
+
+                if (duplicateDetails.length > 0) {
+                    const displayList = duplicateDetails.slice(0, 10).join('\n');
+                    const moreCount = duplicateDetails.length > 10 ? `\n...以及其他 ${duplicateDetails.length - 10} 筆` : '';
+                    
+                    showConfirm("重複提示", `發現重複任務：\n${displayList}${moreCount}\n\n重複新增可能造成重複報工，確定要繼續嗎？`, processBatch);
+                } else {
+                    processBatch();
+                }
+            };
+
+            const updateTask = (id, f, v) => setTasks(ts => ts.map(t => t.id===id ? {...t, [f]: v} : t));
+            const toggleTimer = (id) => setTasks(ts => ts.map(t => t.id===id ? {...t, isRunning: !t.isRunning} : {...t, isRunning: false}));
+            const adjustTime = (id, m) => setTasks(ts => ts.map(t => t.id===id ? {...t, duration: Math.max(0, t.duration + m*60000)} : t));
+            const updateTaskDuration = (id, newDuration) => setTasks(tasks.map(task => task.id === id ? { ...task, duration: Math.max(0, newDuration) } : task));
+            const deleteTask = (id) => showConfirm("刪除", "確定刪除?", () => setTasks(ts => ts.filter(t => t.id !== id)));
+            const clearAll = () => showConfirm("清空", "確定清空?", () => { setTasks([]); localStorage.removeItem('redmine_tasks'); });
+            
             const calculateExpectedHours = () => {
                 const start = new Date(`2000-01-01T${workSettings.startTime}`);
                 const end = new Date(`2000-01-01T${workSettings.endTime}`);
@@ -1128,8 +1792,8 @@
             const expectedHours = calculateExpectedHours();
             const gapHours = (expectedHours - totalHours).toFixed(2);
             const isGap = parseFloat(gapHours) > 0;
+            const stepMinutes = roundTo > 0 ? Math.round(roundTo * 60) : 1;
 
-            // Effect to update gap filler default text
             useEffect(() => {
                 if (globalDate) {
                     setGapFillerState(prev => ({ ...prev, subject: `${globalDate.replace(/-/g, '/')}組內事務` }));
@@ -1139,36 +1803,6 @@
                 }
             }, [globalDate, gapHours, isGap]);
 
-
-            // --- Manual Cloud Load ---
-            const handleManualLoad = () => {
-                showConfirm("確認還原", "這將會使用雲端上的資料覆蓋您目前的設定與任務，確定執行嗎？", async () => {
-                    try {
-                        const data = await window.CloudService.loadData(FIXED_ACCESS_KEY);
-                        if (data.userName) setUserName(data.userName);
-                        if (data.tasks) setTasks(data.tasks);
-                        if (data.globalDate) setGlobalDate(data.globalDate);
-                        if (data.workSettings) setWorkSettings(data.workSettings);
-                        if (data.staticData) setStaticData(data.staticData);
-                        if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
-                        setLastSyncTime(new Date(data.updatedAt || Date.now()));
-                        showAlert("還原成功", "資料已同步至最新狀態！");
-                    } catch (e) { const msg = e.message.includes('OFFLINE_MODE') ? "目前無法連線至雲端 (離線模式)" : e.message; showAlert("還原失敗", msg); }
-                });
-            };
-
-            const showConfirm = (title, message, onConfirm) => setModalConfig({ isOpen: true, type: 'confirm', title, message, onConfirm });
-            const showAlert = (title, message) => setModalConfig({ isOpen: true, type: 'alert', title, message });
-            const closeModal = () => setModalConfig(p => ({...p, isOpen: false}));
-
-            const addTask = (e) => { e.preventDefault(); if (!newTask.issueId) return; setTasks([...tasks, { id: Date.now(), ...newTask, duration: 0, isRunning: false }]); setNewTask({ ...newTask, issueId: '', comment: '' }); };
-            const updateTask = (id, f, v) => setTasks(ts => ts.map(t => t.id===id ? {...t, [f]: v} : t));
-            const toggleTimer = (id) => setTasks(ts => ts.map(t => t.id===id ? {...t, isRunning: !t.isRunning} : {...t, isRunning: false}));
-            const adjustTime = (id, m) => setTasks(ts => ts.map(t => t.id===id ? {...t, duration: Math.max(0, t.duration + m*60000)} : t));
-            const updateTaskDuration = (id, newDuration) => setTasks(tasks.map(task => task.id === id ? { ...task, duration: Math.max(0, newDuration) } : task));
-            const deleteTask = (id) => showConfirm("刪除", "確定刪除?", () => setTasks(ts => ts.filter(t => t.id !== id)));
-            const clearAll = () => showConfirm("清空", "確定清空?", () => { setTasks([]); localStorage.removeItem('redmine_tasks'); });
-            
             const exportCSV = () => {
                 if (!userName.trim()) return showAlert("錯誤", "請先至「設定」輸入用戶名稱");
                 const BOM = "\uFEFF";
@@ -1405,7 +2039,7 @@
                         const url = getFetchUrl(`${baseUrl}/time_entries.json`, redmineApiConfig);
                         const res = await fetch(url, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'X-Redmine-API-Key': redmineApiConfig.apiKey },
+                            headers: { 'Content-Type': 'application/json', 'X-Redmine-API-Key': redmineApiConfig.apiKey }, 
                             body: JSON.stringify(payload)
                         });
 
@@ -1436,8 +2070,16 @@
                 }
                 showAlert("上傳結果", resultMsg);
             };
-
-            const stepMinutes = roundTo > 0 ? Math.round(roundTo * 60) : 1;
+            
+            const handleAddFromHistory = (data) => {
+                 setNewTask(prev => ({
+                     ...prev,
+                     issueId: data.issueId,
+                     projectName: data.projectName,
+                     comment: data.comment
+                 }));
+                 window.scrollTo({ top: 0, behavior: 'smooth' });
+             };
 
             return (
                 <div className="min-h-screen pb-10 relative">
@@ -1455,14 +2097,16 @@
                         setRedmineApiConfig={setRedmineApiConfig}
                         userName={userName}
                         setUserName={setUserName}
+                        setRedmineUserId={setRedmineUserId}
+                        redmineUserId={redmineUserId}
                         syncStatus={syncStatus}
                         lastSyncTime={lastSyncTime}
                         onManualLoad={handleManualLoad}
                         onManualSave={saveToCloud}
                         showAlert={showAlert}
                     />
-
-                    {/* Header */}
+                    
+                    {/* ... (Header) ... */}
                     <div className="bg-white shadow-sm sticky top-0 z-10">
                         <div className="max-w-4xl mx-auto px-4 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
                             <div className="flex items-center gap-2 w-full sm:w-auto">
@@ -1488,12 +2132,12 @@
                             </div>
                             <div className="flex items-center gap-4 w-full sm:w-auto justify-between sm:justify-end">
                                 <div className="text-right">
-                                    <div className="text-xs text-gray-500">預計下班</div>
-                                    <input type="time" value={workSettings.endTime} onChange={e => setWorkSettings({...workSettings, endTime: e.target.value})} className="font-mono bg-transparent border-b border-gray-300 focus:border-red-500 outline-none w-36" />
-                                </div>
-                                <div className="text-right">
                                     <div className="text-xs text-gray-500">日期</div>
                                     <input type="date" value={globalDate} onChange={e => setGlobalDate(e.target.value)} className="font-mono bg-transparent border-b border-gray-300 focus:border-red-500 outline-none" />
+                                </div>
+                                <div className="text-right pl-4 border-l">
+                                    <div className="text-xs text-gray-500">預計下班</div>
+                                    <input type="time" value={workSettings.endTime} onChange={e => setWorkSettings({...workSettings, endTime: e.target.value})} className="font-mono bg-transparent border-b border-gray-300 focus:border-red-500 outline-none w-36" />
                                 </div>
                                 <div className="text-right pl-4 border-l">
                                     <div className="text-xs text-gray-500">目標 {expectedHours.toFixed(1)} / 已記 {totalHours.toFixed(2)}</div>
@@ -1505,50 +2149,73 @@
 
                     <div className="max-w-4xl mx-auto px-4 mt-6">
                         
+                        <DailyActivityPanel 
+                             date={globalDate}
+                             redmineApiConfig={redmineApiConfig}
+                             redmineUserId={redmineUserId}
+                             onAddTask={handleAddFromHistory}
+                             onBatchAdd={handleBatchAddTasks} // Pass batch handler
+                             showAlert={showAlert}
+                             staticData={staticData}
+                             localUserName={userName}
+                        />
+
                         {/* Control Panel */}
                         <div className="bg-white p-6 rounded-xl shadow-sm mb-6">
                             <form onSubmit={addTask} className="flex flex-col gap-4">
-                                <div className="flex flex-col md:flex-row gap-4 items-start">
-                                    <div className="flex-none md:w-32 w-full">
-                                        <label className="text-xs text-gray-500 mb-1 block">Issue ID #</label>
-                                        <input type="number" placeholder="12345" className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" value={newTask.issueId} onChange={e => setNewTask({...newTask, issueId: e.target.value})} required />
-                                    </div>
-                                    <div className="flex-none md:w-40 w-full">
-                                        <label className="text-xs text-gray-500 mb-1 block">專案 (選填)</label>
-                                        <input type="text" placeholder="專案名稱" className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" value={newTask.projectName} onChange={e => setNewTask({...newTask, projectName: e.target.value})} />
-                                    </div>
-                                    <div className="flex-grow w-full">
-                                        <label className="text-xs text-gray-500 mb-1 block">任務說明</label>
-                                        <textarea placeholder="說明..." className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none resize-y overflow-hidden leading-normal" rows={1} value={newTask.comment} onChange={e => { setNewTask({...newTask, comment: e.target.value}); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }} style={{minHeight:'42px'}} />
-                                    </div>
-                                </div>
+                                {/* Row 1: ID, Project, Activity */}
                                 <div className="flex flex-col md:flex-row gap-4">
-                                    <div className="flex-none md:w-48">
+                                    <div className="flex-none w-full md:w-24">
+                                        <label className="text-xs text-gray-500 mb-1 block">Issue Id #</label>
+                                        <input 
+                                            type="number" 
+                                            placeholder="#" 
+                                            className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" 
+                                            value={newTask.issueId} 
+                                            onChange={e => setNewTask({...newTask, issueId: e.target.value})} 
+                                            required 
+                                        />
+                                    </div>
+                                    <div className="flex-grow w-full min-w-0">
+                                        <label className="text-xs text-gray-500 mb-1 block">專案 (選填)</label>
+                                        <input 
+                                            type="text" 
+                                            placeholder="專案名稱" 
+                                            className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none" 
+                                            value={newTask.projectName} 
+                                            onChange={e => setNewTask({...newTask, projectName: e.target.value})} 
+                                        />
+                                    </div>
+                                    <div className="flex-none w-full md:w-40">
                                          <label className="text-xs text-gray-500 mb-1 block">活動類型</label>
-                                         <div className="flex gap-2">
+                                         <div className="flex gap-1">
                                             {staticData.activities.length > 0 ? (
-                                                <select className="flex-grow bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-500" value={newTask.activityId} onChange={e => setNewTask({...newTask, activityId: e.target.value})}>
+                                                <select className="flex-grow bg-gray-50 border border-gray-200 rounded-lg px-2 py-2 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm" value={newTask.activityId} onChange={e => setNewTask({...newTask, activityId: e.target.value})}>
                                                     {staticData.activities.map(opt => <option key={opt.id} value={opt.name}>{opt.name}</option>)}
                                                 </select>
                                             ) : (
-                                                <div className="flex-grow text-xs text-gray-400 border border-dashed rounded px-2 py-2 text-center bg-gray-50">請至設定匯入 JSON</div>
+                                                <div className="flex-grow text-xs text-gray-400 border border-dashed rounded px-2 py-2 text-center bg-gray-50">設定</div>
                                             )}
                                             {/* AI Button */}
                                             <button 
                                                 type="button" 
                                                 onClick={handleAiGuessActivity}
                                                 className="flex-none p-2 bg-purple-100 border border-purple-200 rounded-lg text-purple-600 hover:bg-purple-200 transition-colors" 
-                                                title="AI 智能推測活動類型"
+                                                title="AI 智能推測"
                                             >
-                                                {aiLoading ? <Icon name="loader-2" className="animate-spin" size={20} /> : <Icon name="sparkles" size={20} />}
+                                                {aiLoading ? <Icon name="loader-2" className="animate-spin" size={18} /> : <Icon name="sparkles" size={18} />}
                                             </button>
                                          </div>
                                     </div>
-                                    <div className="flex-grow">
-                                        {/* User Name Removed from main UI */}
+                                </div>
+                                {/* Row 2: Comment, Button */}
+                                <div className="flex flex-col md:flex-row gap-4 items-end">
+                                    <div className="flex-grow w-full">
+                                        <label className="text-xs text-gray-500 mb-1 block">任務說明</label>
+                                        <textarea placeholder="說明..." className="w-full bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-red-500 focus:outline-none resize-y overflow-hidden leading-normal" rows={1} value={newTask.comment} onChange={e => { setNewTask({...newTask, comment: e.target.value}); e.target.style.height='auto'; e.target.style.height=e.target.scrollHeight+'px'; }} style={{minHeight:'42px'}} />
                                     </div>
-                                    <div className="flex-none flex items-end">
-                                        <button type="submit" className="w-full bg-gray-800 hover:bg-gray-700 text-white px-6 py-2 rounded-lg flex items-center justify-center gap-2"><Icon name="plus" size={18} /> 新增任務</button>
+                                    <div className="flex-none w-full md:w-auto">
+                                        <button type="submit" className="w-full bg-gray-800 hover:bg-gray-700 text-white px-6 py-2.5 rounded-lg flex items-center justify-center gap-2 whitespace-nowrap h-[42px]"><Icon name="plus" size={18} /> 新增任務</button>
                                     </div>
                                 </div>
                             </form>
@@ -1600,14 +2267,14 @@
                                             <button onClick={() => adjustTime(task.id, stepMinutes)} className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded text-gray-600">+{stepMinutes}m</button>
                                             <button onClick={() => adjustTime(task.id, -stepMinutes)} className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded text-gray-600">-{stepMinutes}m</button>
                                         </div>
-                                        <button onClick={() => deleteTask(task.id)} className="text-red-400 hover:text-red-600 text-sm flex items-center justify-center gap-1 mt-1"><Icon name="trash-2" size={14} /> 刪除</button>
+                                        <button onClick={() => deleteTask(task.id)} className="text-red-400 hover:text-red-600 text-sm flex items-center justify-center gap-1 mt-1"><Icon name="trash-2" size={14} />刪除</button>
                                     </div>
                                 </div>
                             ))}
                         </div>
-
+                        
                         {/* Gap Filler */}
-                        {isGap && <RedmineGapFiller gapHours={gapHours} date={globalDate} onSuccess={()=>{}} showAlert={showAlert} staticData={staticData} redmineApiConfig={redmineApiConfig} setRedmineApiConfig={setRedmineApiConfig} state={gapFillerState} setState={setGapFillerState} />}
+                        {isGap && <RedmineGapFiller gapHours={gapHours} date={globalDate} showAlert={showAlert} staticData={staticData} onSuccess={()=>{}} redmineApiConfig={redmineApiConfig} setRedmineApiConfig={setRedmineApiConfig} state={gapFillerState} setState={setGapFillerState} />}
 
                         {tasks.length > 0 && (
                             <div className="mt-8 flex flex-col sm:flex-row justify-between items-center bg-gray-800 text-white p-4 rounded-xl shadow-lg gap-4">
