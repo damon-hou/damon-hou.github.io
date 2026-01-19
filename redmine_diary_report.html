@@ -98,6 +98,9 @@
                 try {
                     return await operation();
                 } catch (error) {
+                    // Quick fail on permission denied
+                    if (error.code === 'permission-denied') throw error;
+                    
                     if (i < maxRetries - 1 && (error.code === 'unavailable' || error.message.includes('offline') || error.message.includes('network'))) {
                         console.warn(`Firestore unavailable, retrying... (${i + 1})`);
                         await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
@@ -116,10 +119,16 @@
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 try {
                     await retryOperation(async () => {
-                        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'redmine_timer_v3', accessKey);
+                        // Use a simpler path for standalone usage (when __app_id is not injected)
+                        const collectionPath = typeof __app_id !== 'undefined' 
+                            ? `artifacts/${__app_id}/users/${user.uid}/redmine_timer_v3`
+                            : `users/${user.uid}/redmine_timer_v3`;
+                            
+                        const docRef = doc(db, collectionPath, accessKey);
                         await setDoc(docRef, { ...data, updatedAt: new Date().toISOString(), savedBy: user.uid }, { merge: true });
                     });
                 } catch (e) {
+                    if (e.code === 'permission-denied') throw new Error("PERMISSION_DENIED");
                     if (e.code === 'unavailable' || e.message.includes('offline')) throw new Error("OFFLINE_MODE");
                     throw e;
                 }
@@ -130,12 +139,17 @@
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 try {
                     return await retryOperation(async () => {
-                        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'redmine_timer_v3', accessKey);
+                        const collectionPath = typeof __app_id !== 'undefined' 
+                            ? `artifacts/${__app_id}/users/${user.uid}/redmine_timer_v3`
+                            : `users/${user.uid}/redmine_timer_v3`;
+
+                        const docRef = doc(db, collectionPath, accessKey);
                         const docSnap = await getDoc(docRef);
                         if (docSnap.exists()) return docSnap.data();
                         return null;
                     });
                 } catch (e) {
+                    if (e.code === 'permission-denied') throw new Error("PERMISSION_DENIED");
                     if (e.code === 'unavailable' || e.message.includes('offline')) throw new Error("OFFLINE_MODE");
                     throw e;
                 }
@@ -200,13 +214,15 @@
             if (!config.isOpen) return null;
             return (
                 <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[60] modal-overlay p-4">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 modal-content border border-gray-100">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6 modal-content border border-gray-100 max-h-[90vh] overflow-y-auto">
                         <div className="flex items-center gap-3 mb-4 text-gray-800">
                             {config.type === 'confirm' ? <div className="p-2 bg-yellow-100 text-yellow-600 rounded-full"><Icon name="alert-triangle" size={24} /></div> : <div className="p-2 bg-blue-100 text-blue-600 rounded-full"><Icon name="info" size={24} /></div>}
                             <h3 className="text-lg font-bold">{config.title || '提示'}</h3>
                         </div>
-                        <p className="text-gray-600 mb-8 ml-1 whitespace-pre-wrap text-sm leading-relaxed">{config.message}</p>
-                        <div className="flex justify-end gap-3">
+                        {config.renderContent ? config.renderContent() : (
+                            <p className="text-gray-600 mb-8 ml-1 whitespace-pre-wrap text-sm leading-relaxed">{config.message}</p>
+                        )}
+                        <div className="flex justify-end gap-3 mt-4">
                             {config.type === 'confirm' && <button onClick={onClose} className="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg">取消</button>}
                             <button onClick={() => { if (config.onConfirm) config.onConfirm(); onClose(); }} className={`px-5 py-2 rounded-lg text-white font-bold shadow-sm active:scale-95 ${config.type === 'confirm' ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-800 hover:bg-gray-700'}`}>{config.confirmText || '確定'}</button>
                         </div>
@@ -216,7 +232,7 @@
         };
 
         // --- Settings Modal ---
-        const SettingsModal = ({ isOpen, onClose, options, setOptions, workSettings, setWorkSettings, staticData, setStaticData, redmineApiConfig, setRedmineApiConfig, userName, setUserName, setRedmineUserId, redmineUserId, syncStatus, lastSyncTime, onManualLoad, onManualSave, showAlert }) => {
+        const SettingsModal = ({ isOpen, onClose, options, setOptions, workSettings, setWorkSettings, staticData, setStaticData, redmineApiConfig, setRedmineApiConfig, userName, setUserName, setRedmineUserId, redmineUserId, syncStatus, lastSyncTime, onManualLoad, onManualSave, showAlert, onShowRulesHelp }) => {
             const [localWork, setLocalWork] = useState(workSettings);
             const [localApiConfig, setLocalApiConfig] = useState(redmineApiConfig);
             const [localUserName, setLocalUserName] = useState(userName);
@@ -572,18 +588,22 @@
                             {/* Cloud Sync Status */}
                             <div className="pb-4 border-b border-gray-100">
                                 <h4 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-2"><Icon name="cloud" size={16} /> 雲端同步狀態</h4>
-                                <div className="flex flex-col gap-3 bg-blue-50 p-3 rounded-lg border border-blue-100">
+                                <div className={`flex flex-col gap-3 p-3 rounded-lg border ${syncStatus === 'permission_error' ? 'bg-red-50 border-red-200' : 'bg-blue-50 border-blue-100'}`}>
                                     <div className="flex items-center justify-between">
                                         <div className="text-sm text-gray-600">
                                             狀態: <span className={`font-bold ${
                                                 syncStatus === 'saved' ? 'text-green-600' : 
                                                 syncStatus === 'offline' ? 'text-yellow-600' :
-                                                syncStatus === 'error' ? 'text-red-600' : 'text-blue-600'}`}>
+                                                syncStatus === 'error' || syncStatus === 'permission_error' ? 'text-red-600' : 'text-blue-600'}`}>
                                                 {syncStatus === 'saved' ? '已同步' : 
                                                  syncStatus === 'saving' ? '同步中...' : 
                                                  syncStatus === 'offline' ? '暫時離線' :
+                                                 syncStatus === 'permission_error' ? '權限不足 (無法寫入)' :
                                                  syncStatus === 'error' ? '同步失敗' : '等待中'}
                                             </span>
+                                            {syncStatus === 'permission_error' && (
+                                                <button onClick={onShowRulesHelp} className="ml-2 text-xs bg-red-600 text-white px-2 py-0.5 rounded hover:bg-red-700 underline">如何修復？</button>
+                                            )}
                                         </div>
                                         <div className="text-xs text-gray-400">
                                             {lastSyncTime ? new Date(lastSyncTime).toLocaleTimeString() : '尚未同步'}
@@ -1756,8 +1776,15 @@
                     setSyncStatus('saved');
                     setLastSyncTime(new Date());
                 } catch (e) { 
-                    if (e.message.includes('OFFLINE_MODE')) { console.log("Offline mode"); setSyncStatus('offline'); }
-                    else { console.error("Auto Sync Error:", e); setSyncStatus('error'); }
+                    if (e.message.includes('OFFLINE_MODE')) { 
+                        console.log("Offline mode"); 
+                        setSyncStatus('offline'); 
+                    } else if (e.message === 'PERMISSION_DENIED') {
+                        setSyncStatus('permission_error');
+                    } else { 
+                        console.error("Auto Sync Error:", e); 
+                        setSyncStatus('error'); 
+                    }
                 }
             }, []);
 
@@ -1776,13 +1803,47 @@
                             setLastSyncTime(new Date(data.updatedAt || Date.now()));
                             setSyncStatus('saved');
                         }
-                    } catch (e) { if (e.message.includes('OFFLINE_MODE')) setSyncStatus('offline'); } finally { setIsInitialized(true); }
+                    } catch (e) { 
+                        if (e.message.includes('OFFLINE_MODE')) setSyncStatus('offline');
+                        else if (e.message === 'PERMISSION_DENIED') setSyncStatus('permission_error');
+                    } finally { setIsInitialized(true); }
                 };
                 init();
             }, [isServiceReady]);
 
             useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 500); return () => clearTimeout(timer); }, [userName, workSettings, staticData, redmineApiConfig, saveToCloud, isInitialized]);
             useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 5000); return () => clearTimeout(timer); }, [tasks, saveToCloud, isInitialized]);
+
+            const showRulesHelp = () => {
+                 setModalConfig({
+                    isOpen: true,
+                    title: '如何修復權限不足？',
+                    confirmText: '我了解了',
+                    renderContent: () => (
+                        <div className="space-y-4 text-sm text-gray-600">
+                            <p>您的 Firebase 專案目前的 Firestore 安全性規則設為「鎖定模式」，導致工具無法寫入資料。請依照以下步驟修復：</p>
+                            <ol className="list-decimal pl-5 space-y-2">
+                                <li>前往 <a href="https://console.firebase.google.com/" target="_blank" className="text-blue-600 underline">Firebase Console</a> 並選擇您的專案 (<code>redmine-diary-report</code>)。</li>
+                                <li>點擊左側選單的 <strong>Firestore Database</strong>。</li>
+                                <li>點擊上方的 <strong>Rules (規則)</strong> 分頁。</li>
+                                <li>將編輯器中的程式碼替換為下方內容：</li>
+                            </ol>
+                            <div className="bg-gray-800 text-gray-200 p-3 rounded font-mono text-xs overflow-x-auto select-all">
+                                {`rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}`}
+                            </div>
+                            <p>5. 點擊 <strong>Publish (發布)</strong> 按鈕。</p>
+                            <p className="text-xs text-orange-600 mt-2">修改後約需 1~2 分鐘生效，生效後請重新整理本頁面。</p>
+                        </div>
+                    )
+                });
+            };
 
             const handleManualLoad = () => {
                 showConfirm("確認還原", "這將會使用雲端上的資料覆蓋您目前的設定與任務，確定執行嗎？", async () => {
@@ -1796,7 +1857,11 @@
                         if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
                         setLastSyncTime(new Date(data.updatedAt || Date.now()));
                         showAlert("還原成功", "資料已同步至最新狀態！");
-                    } catch (e) { const msg = e.message.includes('OFFLINE_MODE') ? "目前無法連線至雲端 (離線模式)" : e.message; showAlert("還原失敗", msg); }
+                    } catch (e) { 
+                        const msg = e.message.includes('OFFLINE_MODE') ? "目前無法連線至雲端 (離線模式)" : 
+                                    e.message === 'PERMISSION_DENIED' ? "權限不足，請檢查 Firestore Rules" : e.message; 
+                        showAlert("還原失敗", msg); 
+                    }
                 });
             };
 
@@ -2225,6 +2290,7 @@
                         onManualLoad={handleManualLoad}
                         onManualSave={saveToCloud}
                         showAlert={showAlert}
+                        onShowRulesHelp={showRulesHelp}
                     />
                     
                     {/* ... (Header) ... */}
@@ -2235,13 +2301,15 @@
                                 <h1 className="text-xl font-bold text-gray-800 mr-2">Redmine 工時助手</h1>
                                 
                                 {/* Sync Status Indicator */}
-                                <div className="flex items-center gap-1 text-xs" title={`雲端同步狀態: ${syncStatus === 'saved' ? '已儲存' : syncStatus === 'saving' ? '儲存中...' : syncStatus === 'offline' ? '暫時離線 (資料存於本地)' : syncStatus === 'error' ? '錯誤' : '等待中'}`}>
+                                <div className="flex items-center gap-1 text-xs" title={`雲端同步狀態: ${syncStatus === 'saved' ? '已儲存' : syncStatus === 'saving' ? '儲存中...' : syncStatus === 'offline' ? '暫時離線 (資料存於本地)' : syncStatus === 'permission_error' ? '權限錯誤 (無法寫入)' : syncStatus === 'error' ? '錯誤' : '等待中'}`}>
                                     {syncStatus === 'saving' ? (
                                         <Icon name="loader-2" size={16} className="text-blue-500 animate-spin" />
                                     ) : syncStatus === 'saved' ? (
                                         <Icon name="cloud" size={16} className="text-green-500" />
                                     ) : syncStatus === 'offline' ? (
                                         <Icon name="cloud-off" size={16} className="text-yellow-500" />
+                                    ) : syncStatus === 'permission_error' ? (
+                                        <Icon name="shield-alert" size={16} className="text-red-600" />
                                     ) : syncStatus === 'error' ? (
                                         <Icon name="alert-circle" size={16} className="text-red-500" />
                                     ) : (
