@@ -162,16 +162,17 @@
 
         window.CloudService = {
             isAvailable: () => isFirebaseAvailable,
-            saveData: async (accessKey, data) => {
+            saveData: async (accessKey, data, customUid = null) => {
                 if (!isFirebaseAvailable) throw new Error("OFFLINE_MODE (No Config)");
                 const user = await authReadyPromise;
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 try {
                     await retryOperation(async () => {
+                        const targetUid = customUid || user.uid;
                         // Use a simpler path for standalone usage (when __app_id is not injected)
                         const collectionPath = typeof __app_id !== 'undefined'
-                            ? `artifacts/${__app_id}/users/${user.uid}/redmine_timer_v3`
-                            : `users/${user.uid}/redmine_timer_v3`;
+                            ? `artifacts/${__app_id}/users/${targetUid}/redmine_timer_v3`
+                            : `users/${targetUid}/redmine_timer_v3`;
 
                         const docRef = doc(db, collectionPath, accessKey);
                         await setDoc(docRef, { ...data, updatedAt: new Date().toISOString(), savedBy: user.uid }, { merge: true });
@@ -182,15 +183,16 @@
                     throw e;
                 }
             },
-            loadData: async (accessKey) => {
+            loadData: async (accessKey, customUid = null) => {
                 if (!isFirebaseAvailable) throw new Error("OFFLINE_MODE (No Config)");
                 const user = await authReadyPromise;
                 if (!user) throw new Error("認證失敗 (Auth Failed)");
                 try {
                     return await retryOperation(async () => {
+                        const targetUid = customUid || user.uid;
                         const collectionPath = typeof __app_id !== 'undefined'
-                            ? `artifacts/${__app_id}/users/${user.uid}/redmine_timer_v3`
-                            : `users/${user.uid}/redmine_timer_v3`;
+                            ? `artifacts/${__app_id}/users/${targetUid}/redmine_timer_v3`
+                            : `users/${targetUid}/redmine_timer_v3`;
 
                         const docRef = doc(db, collectionPath, accessKey);
                         const docSnap = await getDoc(docRef);
@@ -263,13 +265,13 @@
             if (!config.isOpen) return null;
             return (
                 <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[60] modal-overlay p-4">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6 modal-content border border-gray-100 max-h-[90vh] overflow-y-auto">
+                    <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6 modal-content border border-gray-100 max-h-[90vh] overflow-y-auto overflow-x-hidden">
                         <div className="flex items-center gap-3 mb-4 text-gray-800">
                             {config.type === 'confirm' ? <div className="p-2 bg-yellow-100 text-yellow-600 rounded-full"><Icon name="alert-triangle" size={24} /></div> : <div className="p-2 bg-blue-100 text-blue-600 rounded-full"><Icon name="info" size={24} /></div>}
                             <h3 className="text-lg font-bold">{config.title || '提示'}</h3>
                         </div>
                         {config.renderContent ? config.renderContent() : (
-                            <p className="text-gray-600 mb-8 ml-1 whitespace-pre-wrap text-sm leading-relaxed">{config.message}</p>
+                            <p className="text-gray-600 mb-8 ml-1 whitespace-pre-wrap break-words break-all text-sm leading-relaxed">{config.message}</p>
                         )}
                         <div className="flex justify-end gap-3 mt-4">
                             {config.type === 'confirm' && <button onClick={onClose} className="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg">取消</button>}
@@ -544,9 +546,13 @@
 
                 await handleFetchUser(true);
 
-                const p1 = fetchAndParse(localApiConfig.projectsApiUrl || '', 'projects', true).then(res => res && setStaticData(prev => ({ ...prev, projects: res })));
-                const p2 = fetchAndParse(localApiConfig.trackersApiUrl || '', 'trackers', true).then(res => res && setStaticData(prev => ({ ...prev, trackers: res })));
-                const p3 = fetchAndParse(localApiConfig.activitiesApiUrl || '', 'activities', true).then(res => res && setStaticData(prev => ({ ...prev, activities: res })));
+                const defaultProjectsUrl = '/projects.json?key={密鑰}&limit=100&offset=0\n/projects.json?key={密鑰}&limit=100&offset=100\n/projects.json?key={密鑰}&limit=100&offset=200';
+                const defaultTrackersUrl = '/projects/old_web.json?include=trackers&key={密鑰}';
+                const defaultActivitiesUrl = '/enumerations/time_entry_activities.json?key={密鑰}';
+
+                const p1 = fetchAndParse(localApiConfig.projectsApiUrl || defaultProjectsUrl, 'projects', true).then(res => res && setStaticData(prev => ({ ...prev, projects: res })));
+                const p2 = fetchAndParse(localApiConfig.trackersApiUrl || defaultTrackersUrl, 'trackers', true).then(res => res && setStaticData(prev => ({ ...prev, trackers: res })));
+                const p3 = fetchAndParse(localApiConfig.activitiesApiUrl || defaultActivitiesUrl, 'activities', true).then(res => res && setStaticData(prev => ({ ...prev, activities: res })));
 
                 await Promise.all([p1, p2, p3]);
 
@@ -1819,7 +1825,14 @@
                 doneRatio: 100
             });
 
-            const [newTask, setNewTask] = useState({ issueId: '', comment: '', activityId: staticData.activities[0]?.name || 'Development', projectName: '' });
+            const [newTask, setNewTask] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('redmine_new_task_draft');
+                    return saved ? JSON.parse(saved) : { issueId: '', comment: '', activityId: staticData.activities[0]?.name || 'Development', projectName: '' };
+                } catch {
+                    return { issueId: '', comment: '', activityId: staticData.activities[0]?.name || 'Development', projectName: '' };
+                }
+            });
             const [roundTo, setRoundTo] = useState(0.25);
             const [isSettingsOpen, setIsSettingsOpen] = useState(false);
             const [modalConfig, setModalConfig] = useState({ isOpen: false, type: 'alert', title: '', message: '' });
@@ -1834,8 +1847,8 @@
             const [syncStatus, setSyncStatus] = useState('idle');
             const [lastSyncTime, setLastSyncTime] = useState(null);
 
-            const stateRef = useRef({ tasks, userName, globalDate, workSettings, staticData, redmineApiConfig });
-            useEffect(() => { stateRef.current = { tasks, userName, globalDate, workSettings, staticData, redmineApiConfig }; }, [tasks, userName, globalDate, workSettings, staticData, redmineApiConfig]);
+            const stateRef = useRef({ tasks, userName, globalDate, workSettings, staticData, redmineApiConfig, newTask });
+            useEffect(() => { stateRef.current = { tasks, userName, globalDate, workSettings, staticData, redmineApiConfig, newTask }; }, [tasks, userName, globalDate, workSettings, staticData, redmineApiConfig, newTask]);
 
             // Persistence LocalStorage
             useEffect(() => localStorage.setItem('redmine_user_v2', userName), [userName]);
@@ -1852,6 +1865,11 @@
             useEffect(() => {
                 if (redmineUserId) localStorage.setItem('redmine_user_id', redmineUserId);
             }, [redmineUserId]);
+
+            // [NEW] Auto-save newTask draft
+            useEffect(() => {
+                localStorage.setItem('redmine_new_task_draft', JSON.stringify(newTask));
+            }, [newTask]);
 
             useEffect(() => {
                 if (staticData.activities.length > 0) {
@@ -1870,13 +1888,41 @@
                 if (!checkService()) { const i = setInterval(() => { if (checkService()) clearInterval(i); }, 200); return () => clearInterval(i); }
             }, []);
 
+            // [NEW] Helper for API Key Hash
+            const getApiKeyHash = useCallback((key) => {
+                if (!key) return null;
+                let hash = 0;
+                for (let i = 0; i < key.length; i++) {
+                    const char = key.charCodeAt(i);
+                    hash = ((hash << 5) - hash) + char;
+                    hash |= 0;
+                }
+                return 'key_' + Math.abs(hash).toString(36) + key.substring(0, 3) + key.substring(key.length - 3);
+            }, []);
+
             const saveToCloud = useCallback(async (dataOverride = null) => {
                 if (!window.CloudService) return;
                 setSyncStatus('saving');
                 try {
                     const currentState = stateRef.current;
-                    const dataToSave = dataOverride || { userName: currentState.userName, tasks: currentState.tasks.map(t => ({ ...t, isRunning: false })), globalDate: currentState.globalDate, workSettings: currentState.workSettings, staticData: currentState.staticData, redmineApiConfig: currentState.redmineApiConfig };
-                    await window.CloudService.saveData(FIXED_ACCESS_KEY, dataToSave);
+                    const dataToSave = dataOverride || {
+                        userName: currentState.userName,
+                        tasks: currentState.tasks.map(t => ({ ...t, isRunning: false })),
+                        globalDate: currentState.globalDate,
+                        workSettings: currentState.workSettings,
+                        staticData: currentState.staticData,
+                        redmineApiConfig: currentState.redmineApiConfig
+                    };
+
+                    // [FIX] Only sync draft if it has content. Prevents empty draft from new browser overwriting cloud data.
+                    if (currentState.newTask && currentState.newTask.comment) {
+                        dataToSave.newTask = currentState.newTask;
+                    }
+
+                    const apiKey = currentState.redmineApiConfig?.apiKey;
+                    const customUid = apiKey ? getApiKeyHash(apiKey) : null;
+
+                    await window.CloudService.saveData(FIXED_ACCESS_KEY, dataToSave, customUid);
                     setSyncStatus('saved');
                     setLastSyncTime(new Date());
                 } catch (e) {
@@ -1890,13 +1936,15 @@
                         setSyncStatus('error');
                     }
                 }
-            }, []);
+            }, [newTask]); // Add newTask to dependency
 
             useEffect(() => {
                 if (!isServiceReady) return;
                 const init = async () => {
                     try {
-                        const data = await window.CloudService.loadData(FIXED_ACCESS_KEY);
+                        const apiKey = redmineApiConfig.apiKey;
+                        const customUid = apiKey ? getApiKeyHash(apiKey) : null;
+                        const data = await window.CloudService.loadData(FIXED_ACCESS_KEY, customUid);
                         if (data) {
                             if (data.userName) setUserName(data.userName);
                             if (data.tasks) setTasks(data.tasks.map(t => ({ ...t, isRunning: false })));
@@ -1904,6 +1952,9 @@
                             if (data.workSettings) setWorkSettings(data.workSettings);
                             if (data.staticData) setStaticData(data.staticData);
                             if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
+                            // [FIX] Do NOT auto-restore draft on init. Only restore settings.
+                            // Draft restore should be manual or explicit to differentiate "New Session" vs "Restore".
+
                             setLastSyncTime(new Date(data.updatedAt || Date.now()));
                             setSyncStatus('saved');
                         }
@@ -1916,7 +1967,8 @@
             }, [isServiceReady]);
 
             useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 500); return () => clearTimeout(timer); }, [userName, workSettings, staticData, redmineApiConfig, saveToCloud, isInitialized]);
-            useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 5000); return () => clearTimeout(timer); }, [tasks, saveToCloud, isInitialized]);
+            // Save faster for draft changes
+            useEffect(() => { if (!isInitialized) return; const timer = setTimeout(() => { saveToCloud(); }, 2000); return () => clearTimeout(timer); }, [tasks, newTask, saveToCloud, isInitialized]);
 
             const showRulesHelp = () => {
                 setModalConfig({
@@ -1950,20 +2002,40 @@ service cloud.firestore {
             };
 
             const handleManualLoad = () => {
+                const apiKey = redmineApiConfig.apiKey;
+                // [NEW] Check API Key presence
+                if (!apiKey) {
+                    showAlert("提示", "請先輸入 Redmine API Key 作為您的身份識別，才能還原雲端資料。\n\n(系統使用 API Key 來查找您備份的設定)");
+                    return;
+                }
+
                 showConfirm("確認還原", "這將會使用雲端上的資料覆蓋您目前的設定與任務，確定執行嗎？", async () => {
+                    setSyncStatus('saving');
                     try {
-                        const data = await window.CloudService.loadData(FIXED_ACCESS_KEY);
-                        if (data.userName) setUserName(data.userName);
-                        if (data.tasks) setTasks(data.tasks);
-                        if (data.globalDate) setGlobalDate(data.globalDate);
-                        if (data.workSettings) setWorkSettings(data.workSettings);
-                        if (data.staticData) setStaticData(data.staticData);
-                        if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
-                        setLastSyncTime(new Date(data.updatedAt || Date.now()));
-                        showAlert("還原成功", "資料已同步至最新狀態！");
+                        const customUid = getApiKeyHash(apiKey);
+                        const data = await window.CloudService.loadData(FIXED_ACCESS_KEY, customUid);
+                        if (data) {
+                            if (data.workSettings) setWorkSettings(data.workSettings);
+                            if (data.staticData) setStaticData(data.staticData);
+                            if (data.redmineApiConfig) setRedmineApiConfig(data.redmineApiConfig);
+                            if (data.userName) setUserName(data.userName);
+                            if (data.tasks) {
+                                setTasks(data.tasks.map(t => ({ ...t, isRunning: false })));
+                            }
+                            // [NEW] Restore draft
+                            if (data.newTask) setNewTask(data.newTask);
+
+                            setLastSyncTime(new Date(data.updatedAt || Date.now()));
+                            setSyncStatus('saved');
+                            showAlert("還原成功", "資料已同步至最新狀態！");
+                        } else {
+                            showAlert("提示", "雲端尚無對應此 API Key 的資料。");
+                            setSyncStatus('idle');
+                        }
                     } catch (e) {
                         const msg = e.message.includes('OFFLINE_MODE') ? "目前無法連線至雲端 (離線模式)" :
                             e.message === 'PERMISSION_DENIED' ? "權限不足，請檢查 Firestore Rules" : e.message;
+                        setSyncStatus(e.message === 'PERMISSION_DENIED' ? 'permission_error' : 'error');
                         showAlert("還原失敗", msg);
                     }
                 });
